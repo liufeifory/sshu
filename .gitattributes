@@ -1,0 +1,16 @@
+# 仓库内统一用 LF 存储，避免 Windows / Linux 交叉提交出现整文件 diff
+* text=auto eol=lf
+
+# Windows 脚本保持 CRLF，方便在 cmd / PowerShell 里直接双击运行
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Linux / macOS 脚本必须是 LF
+*.sh text eol=lf
+
+# 二进制产物不要做换行转换
+*.exe binary
+*.png binary
+*.jpg binary
+*.gz binary
