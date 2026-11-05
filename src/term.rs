@@ -27,7 +27,7 @@ mod backend {
         GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetConsoleScreenBufferInfo,
         GetStdHandle, SetConsoleCP, SetConsoleMode, SetConsoleOutputCP,
         CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
-        ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
+        ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
         ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
 
@@ -87,13 +87,13 @@ mod backend {
                     return Err(unavailable());
                 }
 
-                let new_in = (in_mode
-                    & !(ENABLE_PROCESSED_INPUT
-                        | ENABLE_LINE_INPUT
-                        | ENABLE_ECHO_INPUT
-                        | ENABLE_QUICK_EDIT_MODE))
-                    | ENABLE_EXTENDED_FLAGS
-                    | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            // 保留 ENABLE_QUICK_EDIT_MODE：传统控制台的鼠标选择复制 / 右键粘贴依赖它。
+            // 泄漏进来的鼠标/焦点 VT 事件由 input.rs 的 filter_events 统一丢弃；
+            // 远端程序的鼠标上报在远端输出侧也已用 ?1000l 等序列关闭。
+            let new_in = (in_mode
+                & !(ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT))
+                | ENABLE_EXTENDED_FLAGS
+                | ENABLE_VIRTUAL_TERMINAL_INPUT;
                 if SetConsoleMode(hin, new_in) == 0 {
                     close_all(&opened);
                     return Err(unavailable());

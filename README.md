@@ -83,6 +83,13 @@ sshu --debug root@host               # 记录击键级调试日志
 - 直接在提示符处输入 `put ...` / `get ...` / `lcd [目录]` / `lll`；
 - 或按 `Ctrl-]` 进入 `(sshu)` 本地命令模式，空行回车回到远端 shell。
 
+复制粘贴与普通终端一致：
+
+- **Windows**：鼠标拖选后回车 / 右键复制（传统控制台 QuickEdit 已保留），
+  Windows Terminal 里用 `Ctrl+Shift+C` / `Ctrl+V`（或右键）；
+- **Linux / macOS**：终端自身的 `Ctrl+Shift+C` / `Ctrl+Shift+V`。
+- 粘贴整段 `put ...` 会被正常拦截；粘贴路径等普通文本原样转发远端。
+
 ### 关于"直接输入"的拦截逻辑
 
 `put` / `get` / `lcd` / `lll` 的**首个字符**（`p`/`g`/`l`/`u`/`d`）会先在客户端本地扣住，
@@ -95,47 +102,6 @@ sshu --debug root@host               # 记录击键级调试日志
 只有当远端当前行处于"行首"（新提示符、刚回车、已删光）时才拦截。按过 `↑` 翻历史或 `Tab` 补全后，
 行内已可能有内容，此时**一律透传不拦截**（避免吞掉你已经输入的命令）——想用会话内指令就先
 `Ctrl-U` 清行，或直接用 `Ctrl-]` 前缀模式。
-
-## 构建
-
-需要 Rust stable 1.75+。
-
-```sh
-# Linux / macOS
-cargo build --release                 # 产物 target/release/sshu
-
-# Linux 静态链接（不挑 glibc 版本，便于分发）
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
-```
-
-```powershell
-# Windows（MinGW 工具链：x86_64-pc-windows-gnu + gcc/nasm）
-powershell -ExecutionPolicy Bypass -File build.ps1     # 产物 dist\sshu.exe
-```
-
-Windows 构建脚本会检查导入表，出现非系统 DLL 直接失败。
-
-## 测试
-
-```sh
-cargo test                            # 纯逻辑单测（状态机、路径解析、补全）
-```
-
-端到端脚本在 `tests/repro/`：
-
-```sh
-# Windows：ConPTY 驱动真实控制台 + 真机远端
-python tests/repro/repro_real.py
-
-# Linux：pty 驱动 sshu 连接本机 sshd（Linux→Linux 全链路）
-python3 tests/repro/repro_linux.py ./target/release/sshu
-
-# 本地复现装置：paramiko 假 sshd，不依赖真实服务器
-python tests/repro/repro_typing.py
-```
-
-测试环境变量：`SSHU_TEST_HOST` / `SSHU_TEST_PORT` / `SSHU_TEST_USER` / `SSHU_TEST_PASS`。
 
 ## 排障
 
