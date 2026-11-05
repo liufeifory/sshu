@@ -306,6 +306,16 @@ impl InputState {
         }
     }
 
+    /// 从隐形命令模式退出：远端 readline 本来就停在空行、提示符已在屏上，
+    /// 不补发回车（否则会多出一个空命令提示符行）。
+    fn leave_cmd_quiet(&mut self, out: &mut Vec<Action>) {
+        debuglog::log("state", "leave invisible cmd mode (cancel)");
+        self.mode = Mode::Pass;
+        self.line.clear();
+        self.auto_return = false;
+        self.utf8.clear();
+    }
+
     fn after_cmd(&mut self, out: &mut Vec<Action>) {
         if self.auto_return {
             self.leave_cmd(out);
@@ -362,17 +372,33 @@ impl InputState {
                 self.after_cmd(out);
             }
             '\x03' => {
-                out.push(Action::Local(b"^C\r\n(sshu) ".to_vec()));
                 self.line.clear();
+                if self.auto_return {
+                    // 隐形命令模式（magic 词+空格进入）：Ctrl-C 视为取消，
+                    // 回到透传模式并把 ^C 转给远端重置其 readline。
+                    self.leave_cmd_quiet(out);
+                    out.push(Action::ToRemote(b"\x03".to_vec()));
+                } else {
+                    out.push(Action::Local(b"^C\r\n(sshu) ".to_vec()));
+                }
             }
             '\x7f' | '\x08' => {
                 if self.line.pop().is_some() {
                     out.push(Action::Local(b"\x08 \x08".to_vec()));
+                    if self.line.is_empty() && self.auto_return {
+                        // 隐形命令模式下把参数删光：用户显然想敲普通 shell 命令，
+                        // 自动退回透传（远端 readline 还是空行，视觉无缝）。
+                        self.leave_cmd_quiet(out);
+                    }
                 }
             }
             '\x15' => {
+                let had = !self.line.is_empty();
                 while self.line.pop().is_some() {
                     out.push(Action::Local(b"\x08 \x08".to_vec()));
+                }
+                if had && self.auto_return {
+                    self.leave_cmd_quiet(out);
                 }
             }
             '\x04' => {
@@ -1042,5 +1068,111 @@ mod tests {
         assert!(a.iter().all(|x| !matches!(x, Action::ToRemote(_))));
         let b = s.feed(b"/tmp/a.txt\x1b[201~\r");
         assert!(has_run(&b, |c| matches!(c, Command::Upload(v) if v == &["/tmp/a.txt"])));
+    }
+}
+
+#[cfg(test)]
+mod probe {
+    use super::*;
+
+    fn sent(actions: &[Action]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for a in actions {
+            if let Action::ToRemote(b) = a {
+                v.extend_from_slice(b);
+            }
+        }
+        v
+    }
+
+    fn locals_str(actions: &[Action]) -> String {
+        let mut v = Vec::new();
+        for a in actions {
+            if let Action::Local(b) = a {
+                v.extend_from_slice(b);
+            }
+        }
+        String::from_utf8_lossy(&v).into_owned()
+    }
+
+    /// OSC7 在 "yum search openblas\r" 逐键输入的任意位置异步到达，
+    /// 任何交错都不应把 yum 吞进命令模式。
+    #[test]
+    fn yum_after_lll_any_osc7_timing() {
+        let line = b"yum search openblas\r";
+        for k in 0..=line.len() {
+            let mut s = InputState::new(0x1d, true);
+            s.note_prompt();
+            let _ = s.feed(b"lll\r"); // magic+enter -> Run(Lll) -> auto leave
+            s.note_prompt(); // 远端打印新提示符
+            let mut all = Vec::new();
+            for (idx, &b) in line.iter().enumerate() {
+                if idx == k {
+                    s.note_prompt(); // OSC7 恰好在这敲之前到达
+                }
+                all.extend(s.feed(&[b]));
+            }
+            assert!(
+                !locals_str(&all).contains("未知命令"),
+                "k={k} swallowed yum"
+            );
+            assert!(
+                all.iter().any(|a| matches!(a, Action::ToRemote(v) if v.contains(&b'y'))),
+                "k={k} yum bytes not forwarded"
+            );
+        }
+    }
+
+    /// 隐形命令模式（put+空格进入）下把参数删光，应自动退回透传，
+    /// 后续敲的普通 shell 命令（yum...）必须原样发给远端。
+    #[test]
+    fn cancel_by_backspace_returns_to_pass() {
+        let mut s = InputState::new(0x1d, true);
+        s.note_prompt();
+        let _ = s.feed(b"put "); // magic+space -> invisible cmd mode
+        assert!(s.in_cmd_mode());
+        let erase = s.feed(b"\x7f\x7f\x7f\x7f"); // 删光 "put "
+        assert!(!s.in_cmd_mode(), "should auto-leave after clearing");
+        // 取消路径不应给远端发任何字节（更不能发 \r 误执行）
+        assert!(erase.iter().all(|x| !matches!(x, Action::ToRemote(_))));
+        let a = s.feed(b"yum search openblas\r");
+        assert!(!locals_str(&a).contains("未知命令"));
+        assert_eq!(sent(&a), b"yum search openblas\r");
+    }
+
+    #[test]
+    fn cancel_by_ctrl_u_returns_to_pass() {
+        let mut s = InputState::new(0x1d, true);
+        s.note_prompt();
+        let _ = s.feed(b"get ");
+        let _ = s.feed(b"/tmp/x\x15"); // 输入一半 Ctrl-U 清行
+        assert!(!s.in_cmd_mode());
+        let a = s.feed(b"ls -la\r");
+        assert_eq!(sent(&a), b"ls -la\r");
+    }
+
+    #[test]
+    fn cancel_by_ctrl_c_forwards_etx() {
+        let mut s = InputState::new(0x1d, true);
+        s.note_prompt();
+        let _ = s.feed(b"put ");
+        let a = s.feed(&[0x03]);
+        assert!(!s.in_cmd_mode());
+        assert!(a.iter().any(|x| matches!(x, Action::ToRemote(v) if v == &b"\x03")));
+        assert!(a.iter().all(|x| !matches!(x, Action::ToRemote(v) if v.contains(&b'\r'))));
+    }
+
+    /// 可见的 (sshu) 前缀模式行为不变：删光后停留在命令模式，空行回车退出。
+    #[test]
+    fn prefix_mode_clearing_stays_in_cmd() {
+        let mut s = InputState::new(0x1d, true);
+        s.note_prompt();
+        let _ = s.feed(&[0x1d]); // prefix -> (sshu)
+        assert!(s.in_cmd_mode());
+        let _ = s.feed(b"abc\x7f\x7f\x7f");
+        assert!(s.in_cmd_mode(), "visible mode should stay");
+        let a = s.feed(b"\r");
+        assert!(!s.in_cmd_mode());
+        assert!(a.iter().any(|x| matches!(x, Action::ToRemote(v) if v == &b"\r")));
     }
 }

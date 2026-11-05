@@ -8,7 +8,7 @@ use crate::error::SshuError;
 /// 关闭终端默认开启的鼠标与焦点上报，避免把鼠标事件当成键盘
 /// 输入转发给远端 shell（症状：登录后满屏 35;72;17M 之类的坐标序列）。
 pub const DISABLE_MOUSE_REPORTING: &[u8] =
-    b"[?1000l[?1002l[?1003l[?1006l[?1004l";
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l";
 
 // ---------------------------------------------------------------------------
 // Windows 后端
@@ -430,8 +430,10 @@ mod tests {
     #[test]
     fn disables_mouse_and_focus_reporting() {
         let s = std::str::from_utf8(DISABLE_MOUSE_REPORTING).unwrap();
-        for seq in ["?1000l", "?1002l", "?1003l", "?1006l", "?1004l"] {
-            assert!(s.contains(seq), "{seq} missing in {s:?}");
+        // 每个序列都必须带 ESC 前缀，否则会被当成普通文字打到屏幕上（历史 bug）。
+        for seq in ["\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l", "\x1b[?1006l", "\x1b[?1004l"] {
+            assert!(s.contains(seq), "{seq:?} missing in {s:?}");
         }
+        assert!(!s.contains("]1000l"));
     }
 }

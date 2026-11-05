@@ -214,6 +214,24 @@ try:
     time.sleep(1.0)
     seg = p.text()[m:]
     check("LCD Tab-completion (local dir)", ok, seg[-150:])
+
+    # 10. CANCEL trap: "put " + space enters invisible cmd mode; erase all,
+    # then type a normal bash command -> must go to remote, not be swallowed
+    # with "未知命令" (regression: user's yum search got swallowed).
+    m = len(p.text())
+    p.send("put ")
+    time.sleep(0.4)
+    for _ in range(4):
+        p.send(b"\x7f")
+        time.sleep(0.05)
+    time.sleep(0.3)
+    p.send("echo cancel_ok_$((21*2))")
+    time.sleep(0.3)
+    p.send("\r")
+    ok = p.wait_text("cancel_ok_42", 10)
+    time.sleep(1.0)
+    seg = p.text()[m:]
+    check("CANCEL put-args then bash cmd", ok and "未知命令" not in seg, seg[-150:])
 finally:
     p.close()
 
