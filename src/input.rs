@@ -308,7 +308,7 @@ impl InputState {
 
     /// 从隐形命令模式退出：远端 readline 本来就停在空行、提示符已在屏上，
     /// 不补发回车（否则会多出一个空命令提示符行）。
-    fn leave_cmd_quiet(&mut self, out: &mut Vec<Action>) {
+    fn leave_cmd_quiet(&mut self, _out: &mut Vec<Action>) {
         debuglog::log("state", "leave invisible cmd mode (cancel)");
         self.mode = Mode::Pass;
         self.line.clear();
