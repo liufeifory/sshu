@@ -7,6 +7,7 @@ use russh::client::Handle;
 use tokio::sync::mpsc;
 
 use crate::cli::{parse_prefix, Args};
+use crate::emu;
 use crate::error::SshuError;
 use crate::input::{Action, Command, InputState};
 use crate::osc7::Osc7Tracker;
@@ -98,6 +99,9 @@ pub async fn run(
     let mut last_status = String::new();
     let mut last_version = osc.version();
     let mut last_size = (cols, rows);
+    // 影子终端模拟器：跟踪远端 VT 状态（全屏模式、光标位置）。
+    let mut emu = emu::Emu::new(cols, rows);
+    let mut prev_fullscreen = false;
     // 全屏应用（top/vim/less 等发 smkx/1049）进入时临时取消了滚动区域，
     // 等下一个 OSC7 提示符（应用已退出、shell 提示符恢复）再补回来。
     let mut region_dirty = false;
@@ -127,29 +131,47 @@ pub async fn run(
                 match ev {
                     ShellEvent::Data(d) => {
                         crate::debuglog::log_bytes("remote-out", &d);
+                        // 先喂影子模拟器拿准确状态，再原样透传给本地终端。
+                        emu.feed(&d);
                         let _ = console.write_all(&d);
                         osc.feed(&d);
+                        // 全屏接管判定改由模拟器驱动：ALT_SCREEN(1049) 或
+                        // APP_CURSOR(smkx) 任一置位即视为接管，边沿触发。
+                        let fullscreen = emu.fullscreen();
+                        if fullscreen && !prev_fullscreen {
+                            input.set_alt_screen(true);
+                            // DECSTBM 复位同样会归位光标，用 DECSC/DECRC 保护。
+                            let _ = console.write_all(b"\x1b7\x1b[r\x1b8");
+                            region_dirty = true;
+                        } else if !fullscreen && prev_fullscreen {
+                            input.set_alt_screen(false);
+                        }
+                        prev_fullscreen = fullscreen;
                         if osc.version() != last_version {
                             last_version = osc.version();
                             input.note_prompt();
                             if region_dirty {
                                 region_dirty = false;
-                                if let Some(seq) = bar_setup_sequence(console.size().1) {
+                                let (_, nrows) = console.size();
+                                // 光标停在最后一行（状态栏行，区域外）时，
+                                // 直接恢复滚动区域会让 shell 提示符落在区域外、
+                                // 与状态栏互相踩踏。先用 \r\n 滚动一行（此时
+                                // 区域是全屏的），恢复区域后再把光标上移一行。
+                                let (crow, _) = emu.cursor();
+                                let mut seq = String::new();
+                                if crow + 1 >= nrows as usize {
+                                    seq.push_str("\r\n");
+                                    if let Some(s) = bar_setup_sequence(nrows) {
+                                        seq.push_str(&s);
+                                    }
+                                    seq.push_str("\r\x1b[1A");
+                                } else if let Some(s) = bar_setup_sequence(nrows) {
+                                    seq.push_str(&s);
+                                }
+                                if !seq.is_empty() {
                                     let _ = console.write_all(seq.as_bytes());
                                 }
                             }
-                        }
-                        // smkx（ESC[?1h）与 1049 都是全屏应用接管的标志：
-                        // 必须临时取消滚动区域，否则应用退出时的光标定位
-                        // （如 top 退出时 ESC[34;1H 跳到屏幕底部之外）会被
-                        // 区域夹持，导致后续输出渲染错乱甚至不可见。
-                        if contains(&d, b"\x1b[?1049h") || contains(&d, b"\x1b[?1h") {
-                            input.set_alt_screen(true);
-                            let _ = console.write_all(b"\x1b[r");
-                            region_dirty = true;
-                        }
-                        if contains(&d, b"\x1b[?1049l") || contains(&d, b"\x1b[?1l") {
-                            input.set_alt_screen(false);
                         }
                     }
                     ShellEvent::Eof => {
@@ -184,6 +206,7 @@ pub async fn run(
         let size = console.size();
         if size != last_size {
             last_size = size;
+            emu.resize(size.0, size.1);
             bar.teardown(&console);
             let _ = shell.resize.send(size);
             bar = Bar::new(size.0, size.1);
@@ -210,10 +233,6 @@ pub async fn run(
 
     bar.teardown(&console);
     Ok(())
-}
-
-fn contains(hay: &[u8], needle: &[u8]) -> bool {
-    hay.windows(needle.len()).any(|w| w == needle)
 }
 
 /// 统一处理输入状态机产出的动作（输入分支与空闲 tick 共用）。
@@ -350,9 +369,10 @@ fn bar_setup_sequence(rows: u16) -> Option<String> {
     if rows < 2 {
         return None;
     }
-    // 只设滚动区（最后一行留给状态栏）；光标留在当前位置，
-    // 远端 MOTD/提示符从那里继续输出。
-    Some(format!("\x1b[1;{}r", rows - 1))
+    // 只设滚动区（最后一行留给状态栏）。DECSTBM 规范规定设置滚动区域
+    // 会把光标归位 (1,1)，因此用 DECSC/DECRC 包裹：设置后立即还原光标，
+    // 否则 top 等应用退出后恢复区域时，光标会跳到窗口最顶部。
+    Some(format!("\x1b7\x1b[1;{}r\x1b8", rows - 1))
 }
 
 struct Bar {
@@ -417,20 +437,8 @@ mod tests {
     #[test]
     fn bar_setup_only_sets_scroll_region() {
         let seq = bar_setup_sequence(30).expect("rows >= 2");
-        assert_eq!(seq, "\x1b[1;29r");
+        // DECSC + DECSTBM + DECRC：设置滚动区域时不移动光标。
+        assert_eq!(seq, "\x1b7\x1b[1;29r\x1b8");
         assert!(bar_setup_sequence(1).is_none());
-    }
-
-    #[test]
-    fn smkx_detection_not_confused_by_other_modes() {
-        // smkx/1049 触发全屏模式；其他 ?1xxx 序列不得误匹配。
-        assert!(contains(b"\x1b[?1h\x1b=", b"\x1b[?1h"));
-        assert!(contains(b"\x1b[?1049h", b"\x1b[?1049h"));
-        assert!(!contains(b"\x1b[?1049h", b"\x1b[?1h"));
-        assert!(!contains(b"\x1b[?1034h", b"\x1b[?1h"));
-        assert!(contains(b"\x1b[?1l\x1b>", b"\x1b[?1l"));
-        assert!(!contains(b"\x1b[?12l", b"\x1b[?1l"));
-        assert!(!contains(b"\x1b[?1000l", b"\x1b[?1l"));
-        assert!(!contains(b"\x1b[?1049l", b"\x1b[?1l"));
     }
 }
