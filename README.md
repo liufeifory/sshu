@@ -39,6 +39,10 @@ drwxr-xr-x        - 2026-11-05 12:40 dist/
 - **远端 cwd 自动跟踪**：通过 OSC7 钩子实时拿到远端 shell 的当前目录，`put` 不用每次写全路径。
 - **传输进度**：底部状态栏显示百分比、吞吐、剩余时间，完成后自动清除。
 - **Ctrl-] 命令模式**：前缀键进入 `(sshu)` 本地命令模式，空行回车回到远端 shell。
+- **终端网格渲染**：内置基于 [alacritty_terminal](https://github.com/alacritty/alacritty) 的终端模拟器，
+  远端输出先进入 VT100/xterm 网格再按行重绘，top / vim / less 等全屏应用进出后画面不再错乱。
+- **回滚历史**：`PgUp` / `PgDn`（含 `Shift`/`Ctrl` 组合）在客户端内翻页查看历史（默认 10000 行），
+  任意键入自动回到最新输出。
 
 `upload` / `download` 保留为 `put` / `get` 的兼容别名。
 
@@ -103,6 +107,9 @@ sshu --debug root@host
 命令解析结果、传输状态。提 issue 时附上这段日志，基本能还原每一步决策。
 
 ## 已知限制
+
+- 回滚历史用 `PgUp` / `PgDn` 翻页，暂不支持鼠标滚轮滚动。
+- 远端设置的窗口标题（OSC 0/2）不会转发给本地终端。
 
 - 只有密码登录；不支持私钥、Pageant、ssh-agent。
 - `put` / `get` 依赖远端 SFTP 子系统；SFTP 被禁用时 shell 仍可用，但传输会明确报错。

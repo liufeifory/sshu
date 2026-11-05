@@ -63,7 +63,9 @@ pub async fn run(
     }
 
     let (cols, rows) = console.size();
-    let mut shell = spawn_shell(handle, hook_cmd, cols, rows)
+    // 最后一行留给状态栏，远端 PTY 只使用前 rows-1 行。
+    let content_rows = rows.saturating_sub(1).max(1);
+    let mut shell = spawn_shell(handle, hook_cmd, cols, content_rows)
         .await
         .map_err(AppError::OpenShell)?;
 
@@ -89,8 +91,12 @@ pub async fn run(
     // 清屏：远端 MOTD/提示符从干净的第一行开始；不再打印横幅
     // （用法见 README；--debug 日志与钩子警告仍会输出到屏幕）。
     let _ = console.write_all(b"\x1b[2J\x1b[H");
+    // 终端模拟器 + 网格渲染：远端输出不再透传，而是进网格后由 Screen
+    // 按行 diff 重绘；状态栏单独占用最后一行。
+    let mut screen = emu::Screen::new(cols, content_rows);
     if let Some(w) = &hook_warning {
-        let _ = console.write_all(format!("[警告] {w}\r\n").as_bytes());
+        let out = screen.print(format!("[警告] {w}\r\n").as_bytes());
+        let _ = console.write_all(out.as_bytes());
     }
 
     let mut bar = Bar::new(cols, rows);
@@ -99,18 +105,26 @@ pub async fn run(
     let mut last_status = String::new();
     let mut last_version = osc.version();
     let mut last_size = (cols, rows);
-    // 影子终端模拟器：跟踪远端 VT 状态（全屏模式、光标位置）。
-    let mut emu = emu::Emu::new(cols, rows);
     let mut prev_fullscreen = false;
-    // 全屏应用（top/vim/less 等发 smkx/1049）进入时临时取消了滚动区域，
-    // 等下一个 OSC7 提示符（应用已退出、shell 提示符恢复）再补回来。
-    let mut region_dirty = false;
 
     loop {
         let mut disconnected = false;
         tokio::select! {
             Some(bytes) = input_rx.recv() => {
                 crate::debuglog::log_bytes("console-in", &bytes);
+                // PgUp/PgDn（含 Shift/Ctrl 变体）：本地翻页查看回滚历史。
+                if let Some(up) = scroll_key(&bytes) {
+                    let out = screen.scroll_page(up);
+                    if !out.is_empty() {
+                        let _ = console.write_all(out.as_bytes());
+                    }
+                    continue;
+                }
+                // 任意其它键入都回到最新输出（与真实终端一致）。
+                let back = screen.reset_scroll();
+                if !back.is_empty() {
+                    let _ = console.write_all(back.as_bytes());
+                }
                 for action in input.feed(&bytes) {
                     if let Action::Complete(line) = action {
                         // Tab 补全：远端路径需要 SFTP 异步列目录，就地 await。
@@ -120,10 +134,10 @@ pub async fn run(
                         let mut acts = Vec::new();
                         input.apply_completion(comp, &mut acts);
                         for a in acts {
-                            dispatch(a, &shell, &console, &gate, &mut status, &sftp, &osc, &st_tx);
+                            dispatch(a, &shell, &console, &mut screen, &gate, &mut status, &sftp, &osc, &st_tx);
                         }
                     } else {
-                        dispatch(action, &shell, &console, &gate, &mut status, &sftp, &osc, &st_tx);
+                        dispatch(action, &shell, &console, &mut screen, &gate, &mut status, &sftp, &osc, &st_tx);
                     }
                 }
             }
@@ -131,57 +145,40 @@ pub async fn run(
                 match ev {
                     ShellEvent::Data(d) => {
                         crate::debuglog::log_bytes("remote-out", &d);
-                        // 先喂影子模拟器拿准确状态，再原样透传给本地终端。
-                        emu.feed(&d);
-                        let _ = console.write_all(&d);
+                        // 远端输出进网格 → 按行 diff 重绘（不再透传字节）。
+                        let out = screen.feed(&d);
                         osc.feed(&d);
-                        // 全屏接管判定改由模拟器驱动：ALT_SCREEN(1049) 或
+                        // 全屏接管判定由模拟器驱动：ALT_SCREEN(1049) 或
                         // APP_CURSOR(smkx) 任一置位即视为接管，边沿触发。
-                        let fullscreen = emu.fullscreen();
-                        if fullscreen && !prev_fullscreen {
-                            input.set_alt_screen(true);
-                            // DECSTBM 复位同样会归位光标，用 DECSC/DECRC 保护。
-                            let _ = console.write_all(b"\x1b7\x1b[r\x1b8");
-                            region_dirty = true;
-                        } else if !fullscreen && prev_fullscreen {
-                            input.set_alt_screen(false);
+                        let fullscreen = screen.fullscreen();
+                        if fullscreen != prev_fullscreen {
+                            input.set_alt_screen(fullscreen);
+                            prev_fullscreen = fullscreen;
                         }
-                        prev_fullscreen = fullscreen;
                         if osc.version() != last_version {
                             last_version = osc.version();
                             input.note_prompt();
-                            if region_dirty {
-                                region_dirty = false;
-                                let (_, nrows) = console.size();
-                                // 光标停在最后一行（状态栏行，区域外）时，
-                                // 直接恢复滚动区域会让 shell 提示符落在区域外、
-                                // 与状态栏互相踩踏。先用 \r\n 滚动一行（此时
-                                // 区域是全屏的），恢复区域后再把光标上移一行。
-                                let (crow, _) = emu.cursor();
-                                let mut seq = String::new();
-                                if crow + 1 >= nrows as usize {
-                                    seq.push_str("\r\n");
-                                    if let Some(s) = bar_setup_sequence(nrows) {
-                                        seq.push_str(&s);
-                                    }
-                                    seq.push_str("\r\x1b[1A");
-                                } else if let Some(s) = bar_setup_sequence(nrows) {
-                                    seq.push_str(&s);
-                                }
-                                if !seq.is_empty() {
-                                    let _ = console.write_all(seq.as_bytes());
-                                }
+                        }
+                        if !out.is_empty() {
+                            let _ = console.write_all(out.as_bytes());
+                            // 重绘会覆盖尚未提交的本地回显（magic 词/参数），
+                            // 按输入状态重新画出来，光标随之移动。
+                            if let Some(pending) = input.pending_echo() {
+                                let _ = console.write_all(pending);
+                                screen.note_echo();
                             }
                         }
                     }
                     ShellEvent::Eof => {
                         crate::debuglog::log("state", "shell eof");
-                        let _ = console.write_all("\r\n[连接已断开]\r\n".as_bytes());
+                        let out = screen.print("\r\n[连接已断开]\r\n".as_bytes());
+                        let _ = console.write_all(out.as_bytes());
                         disconnected = true;
                     }
                     ShellEvent::Error(e) => {
                         crate::debuglog::log("state", &format!("shell error: {e}"));
-                        let _ = console.write_all(format!("\r\n[连接错误] {e}\r\n").as_bytes());
+                        let out = screen.print(format!("\r\n[连接错误] {e}\r\n").as_bytes());
+                        let _ = console.write_all(out.as_bytes());
                         disconnected = true;
                     }
                 }
@@ -206,9 +203,16 @@ pub async fn run(
         let size = console.size();
         if size != last_size {
             last_size = size;
-            emu.resize(size.0, size.1);
+            // 新尺寸下内容行数变化：清屏后全量重绘一次。
+            screen.resize(size.0, size.1.saturating_sub(1).max(1));
+            let clear = screen.clear();
+            let _ = console.write_all(clear.as_bytes());
+            let out = screen.render();
+            let _ = console.write_all(out.as_bytes());
             bar.teardown(&console);
-            let _ = shell.resize.send(size);
+            let _ = shell
+                .resize
+                .send((size.0, size.1.saturating_sub(1).max(1)));
             bar = Bar::new(size.0, size.1);
             bar.setup(&console);
             last_status.clear();
@@ -235,11 +239,21 @@ pub async fn run(
     Ok(())
 }
 
+/// 识别翻页键：Some(true)=向上翻一页，Some(false)=向下一页。
+fn scroll_key(bytes: &[u8]) -> Option<bool> {
+    match bytes {
+        b"\x1b[5~" | b"\x1b[5;2~" | b"\x1b[5;3~" | b"\x1b[5;5~" => Some(true),
+        b"\x1b[6~" | b"\x1b[6;2~" | b"\x1b[6;3~" | b"\x1b[6;5~" => Some(false),
+        _ => None,
+    }
+}
+
 /// 统一处理输入状态机产出的动作（输入分支与空闲 tick 共用）。
 fn dispatch(
     action: Action,
     shell: &Shell,
     console: &Console,
+    screen: &mut emu::Screen,
     gate: &TransferGate,
     status: &mut StatusSlot,
     sftp: &Option<Sftp>,
@@ -254,19 +268,35 @@ fn dispatch(
         Action::Local(b) => {
             crate::debuglog::log_bytes("local-echo", &b);
             let _ = console.write_all(&b);
+            // 打字回显是覆盖层，光标位置已脱离网格，下帧需重新定位。
+            screen.note_echo();
+        }
+        Action::Print(b) => {
+            crate::debuglog::log_bytes("print", &b);
+            let out = screen.print(&b);
+            let _ = console.write_all(out.as_bytes());
         }
         // Tab 补全在上层调用方处理，不会走到 dispatch。
         Action::Complete(_) => {}
         Action::Run(cmd) => {
             match cmd {
                 // lcd / lll 是纯本地操作，不占用传输门控。
-                Command::Lcd(dir) => crate::local::lcd(dir, console),
-                Command::Lll => crate::local::lll(console),
+                Command::Lcd(dir) => {
+                    let text = crate::local::lcd(dir);
+                    let out = screen.print(text.as_bytes());
+                    let _ = console.write_all(out.as_bytes());
+                }
+                Command::Lll => {
+                    let text = crate::local::lll();
+                    let out = screen.print(text.as_bytes());
+                    let _ = console.write_all(out.as_bytes());
+                }
                 Command::Upload(_) | Command::Download(_) => {
                     crate::debuglog::log("cmd", &format!("run {cmd:?}"));
                     if !gate.try_begin() {
-                        let msg = "\u{000d}\u{000a}已有传输在进行中，请等待完成\u{000d}\u{000a}";
-                        let _ = console.write_all(msg.as_bytes());
+                        let msg = "\r\n已有传输在进行中，请等待完成\r\n";
+                        let out = screen.print(msg.as_bytes());
+                        let _ = console.write_all(out.as_bytes());
                     } else {
                         status.begin();
                         start_command(sftp, &cmd, osc.cwd(), st_tx);
@@ -365,16 +395,6 @@ impl TransferGate {
     }
 }
 
-fn bar_setup_sequence(rows: u16) -> Option<String> {
-    if rows < 2 {
-        return None;
-    }
-    // 只设滚动区（最后一行留给状态栏）。DECSTBM 规范规定设置滚动区域
-    // 会把光标归位 (1,1)，因此用 DECSC/DECRC 包裹：设置后立即还原光标，
-    // 否则 top 等应用退出后恢复区域时，光标会跳到窗口最顶部。
-    Some(format!("\x1b7\x1b[1;{}r\x1b8", rows - 1))
-}
-
 struct Bar {
     cols: u16,
     rows: u16,
@@ -390,12 +410,12 @@ impl Bar {
         }
     }
 
-    fn setup(&mut self, console: &Console) {
-        let Some(seq) = bar_setup_sequence(self.rows) else {
-            return;
-        };
-        let _ = console.write_all(seq.as_bytes());
-        self.active = true;
+    /// 内容区由终端模拟器接管（内容占前 rows-1 行），状态栏直接画在
+    /// 最后一行，不再需要设置滚动区域。
+    fn setup(&mut self, _console: &Console) {
+        if self.rows >= 2 {
+            self.active = true;
+        }
     }
 
     fn draw(&self, console: &Console, text: &str) {
@@ -415,7 +435,7 @@ impl Bar {
 
     fn teardown(&self, console: &Console) {
         if self.active {
-            let seq = format!("\x1b[r\x1b[{};1H\x1b[K", self.rows);
+            let seq = format!("\x1b[{};1H\x1b[K", self.rows);
             let _ = console.write_all(seq.as_bytes());
         }
     }
@@ -434,11 +454,4 @@ mod tests {
         assert!(gate.try_begin());
     }
 
-    #[test]
-    fn bar_setup_only_sets_scroll_region() {
-        let seq = bar_setup_sequence(30).expect("rows >= 2");
-        // DECSC + DECSTBM + DECRC：设置滚动区域时不移动光标。
-        assert_eq!(seq, "\x1b7\x1b[1;29r\x1b8");
-        assert!(bar_setup_sequence(1).is_none());
-    }
 }

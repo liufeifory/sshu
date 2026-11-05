@@ -19,7 +19,10 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     ToRemote(Vec<u8>),
+    /// 打字回显：直接写控制台的临时覆盖层，不进入终端网格。
     Local(Vec<u8>),
+    /// 打印输出（命令结果、列表、提示信息）：进入终端网格，参与滚动。
+    Print(Vec<u8>),
     Run(Command),
     /// Cmd 模式下按 Tab：请求对当前行做补全（本地路径 / SFTP 远端路径）。
     Complete(String),
@@ -90,6 +93,16 @@ impl InputState {
 
     pub fn in_cmd_mode(&self) -> bool {
         self.mode == Mode::Cmd
+    }
+
+    /// 已本地回显但尚未提交的字节。远端重绘会覆盖这些临时回显，
+    /// 渲染后需要按此内容重新画出来。
+    pub fn pending_echo(&self) -> Option<&[u8]> {
+        match self.mode {
+            Mode::Pass => self.pre.as_deref(),
+            // Cmd 模式下行内容（含 magic 词与空格）与屏幕上的回显一致。
+            Mode::Cmd => Some(self.line.as_bytes()),
+        }
     }
 
     /// 行首判断：远端当前行没有未处理的可见输入。
@@ -317,7 +330,9 @@ impl InputState {
         };
         match ch {
             '\r' | '\n' => {
-                out.push(Action::Local(b"\r\n".to_vec()));
+                // 换行必须进终端网格（Print）：后续命令输出要落在下一行，
+                // 否则本地命令的结果会挤在提示符同一行上。
+                out.push(Action::Print(b"\r\n".to_vec()));
                 let line = std::mem::take(&mut self.line);
                 self.utf8.clear();
                 debuglog::log("cmd", &format!("submit line={line:?}"));
@@ -550,7 +565,9 @@ fn parse_term_event(b: &[u8]) -> EventParse {
 
 fn msg(text: &str) -> Action {
     // 调用点（回车提交）已输出过换行，这里不再前置空行。
-    Action::Local(text.as_bytes().to_vec())
+    // Print = 进入终端网格的打印输出（会正常滚动、被后续重绘保留），
+    // 与打字回显（Local，临时覆盖层）区分开。
+    Action::Print(text.as_bytes().to_vec())
 }
 
 #[cfg(test)]
@@ -733,15 +750,7 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(leaked, b"\r"); // 只补发刷新提示符的回车
-        let echoed: Vec<u8> = a
-            .iter()
-            .filter_map(|x| match x {
-                Action::Local(v) => Some(v.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        let echoed = String::from_utf8_lossy(&echoed).to_string();
+        let echoed = String::from_utf8_lossy(&locals(&a)).to_string();
         assert!(!echoed.contains("(sshu)"), "{echoed:?}");
         assert!(echoed.contains("用法"), "{echoed:?}");
     }
@@ -888,11 +897,12 @@ mod tests {
         assert_eq!(sent(&a), b"ls \t");
     }
 
+    /// 收集所有本地可见输出（打字回显 + 打印）。
     fn locals(actions: &[Action]) -> Vec<u8> {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::Local(v) => Some(v.clone()),
+                Action::Local(v) | Action::Print(v) => Some(v.clone()),
                 _ => None,
             })
             .flatten()
@@ -1080,7 +1090,7 @@ mod probe {
     fn locals_str(actions: &[Action]) -> String {
         let mut v = Vec::new();
         for a in actions {
-            if let Action::Local(b) = a {
+            if let Action::Local(b) | Action::Print(b) = a {
                 v.extend_from_slice(b);
             }
         }

@@ -170,8 +170,10 @@ try:
     p.send("\r")
     time.sleep(1.5)
     seg = p.text()[m:]
+    # 列表很长时表头会被滚出可视区（回滚历史在客户端内部），
+    # 因此只要出现列表内容且没有落到 bash 报错即为通过。
     check("LLL magic + local listing",
-          "总计" in seg and "未找到命令" not in seg,
+          ("总计" in seg or "-rw" in seg) and "未找到命令" not in seg,
           seg[-150:])
 
     # 7. get typed directly at prompt: magic-intercepted, downloads into the

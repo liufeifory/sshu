@@ -6,15 +6,14 @@
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::term::Console;
-
 /// lcd [目录]：切换本地工作目录；省略参数 = 显示当前目录。
-pub fn lcd(dir: Option<String>, console: &Console) {
+/// 返回要打印到终端网格的文本。
+pub fn lcd(dir: Option<String>) -> String {
     let res = match &dir {
         Some(d) => std::env::set_current_dir(d),
         None => Ok(()),
     };
-    let text = match res {
+    match res {
         Ok(()) => {
             let cwd = std::env::current_dir()
                 .map(|p| p.display().to_string())
@@ -22,12 +21,12 @@ pub fn lcd(dir: Option<String>, console: &Console) {
             format!("本地目录: {cwd}\r\n")
         }
         Err(e) => format!("失败: 无法切换到 {}: {e}\r\n", dir.unwrap_or_default()),
-    };
-    let _ = console.write_all(text.as_bytes());
+    }
 }
 
 /// lll：列出本地当前目录（目录优先，之后按名称排序），格式对齐 `ls -l`。
-pub fn lll(console: &Console) {
+/// 返回要打印到终端网格的文本。
+pub fn lll() -> String {
     let mut text = String::new();
     match list_cwd() {
         Ok(lines) => {
@@ -39,7 +38,7 @@ pub fn lll(console: &Console) {
         }
         Err(e) => text.push_str(&format!("失败: 无法读取本地目录: {e}\r\n")),
     }
-    let _ = console.write_all(text.as_bytes());
+    text
 }
 
 fn list_cwd() -> std::io::Result<Vec<String>> {
