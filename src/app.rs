@@ -98,6 +98,9 @@ pub async fn run(
     let mut last_status = String::new();
     let mut last_version = osc.version();
     let mut last_size = (cols, rows);
+    // 全屏应用（top/vim/less 等发 smkx/1049）进入时临时取消了滚动区域，
+    // 等下一个 OSC7 提示符（应用已退出、shell 提示符恢复）再补回来。
+    let mut region_dirty = false;
 
     loop {
         let mut disconnected = false;
@@ -129,11 +132,23 @@ pub async fn run(
                         if osc.version() != last_version {
                             last_version = osc.version();
                             input.note_prompt();
+                            if region_dirty {
+                                region_dirty = false;
+                                if let Some(seq) = bar_setup_sequence(console.size().1) {
+                                    let _ = console.write_all(seq.as_bytes());
+                                }
+                            }
                         }
-                        if contains(&d, b"\x1b[?1049h") {
+                        // smkx（ESC[?1h）与 1049 都是全屏应用接管的标志：
+                        // 必须临时取消滚动区域，否则应用退出时的光标定位
+                        // （如 top 退出时 ESC[34;1H 跳到屏幕底部之外）会被
+                        // 区域夹持，导致后续输出渲染错乱甚至不可见。
+                        if contains(&d, b"\x1b[?1049h") || contains(&d, b"\x1b[?1h") {
                             input.set_alt_screen(true);
+                            let _ = console.write_all(b"\x1b[r");
+                            region_dirty = true;
                         }
-                        if contains(&d, b"\x1b[?1049l") {
+                        if contains(&d, b"\x1b[?1049l") || contains(&d, b"\x1b[?1l") {
                             input.set_alt_screen(false);
                         }
                     }
@@ -404,5 +419,18 @@ mod tests {
         let seq = bar_setup_sequence(30).expect("rows >= 2");
         assert_eq!(seq, "\x1b[1;29r");
         assert!(bar_setup_sequence(1).is_none());
+    }
+
+    #[test]
+    fn smkx_detection_not_confused_by_other_modes() {
+        // smkx/1049 触发全屏模式；其他 ?1xxx 序列不得误匹配。
+        assert!(contains(b"\x1b[?1h\x1b=", b"\x1b[?1h"));
+        assert!(contains(b"\x1b[?1049h", b"\x1b[?1049h"));
+        assert!(!contains(b"\x1b[?1049h", b"\x1b[?1h"));
+        assert!(!contains(b"\x1b[?1034h", b"\x1b[?1h"));
+        assert!(contains(b"\x1b[?1l\x1b>", b"\x1b[?1l"));
+        assert!(!contains(b"\x1b[?12l", b"\x1b[?1l"));
+        assert!(!contains(b"\x1b[?1000l", b"\x1b[?1l"));
+        assert!(!contains(b"\x1b[?1049l", b"\x1b[?1l"));
     }
 }

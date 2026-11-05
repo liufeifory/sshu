@@ -128,6 +128,10 @@ try:
           seg[-150:])
 
     # 4. Up-arrow then type -> must passthrough (design: line content unknown)
+    #    先清空 bash history：避免上一次运行遗留的历史被上箭头召回，
+    #    与 put 拼成合法 echo 命令导致断言失真。
+    p.send("history -c\r")
+    time.sleep(1.0)
     m = len(p.text())
     p.send(b"\x1b[A")
     time.sleep(0.5)
