@@ -1,0 +1,10 @@
+/target
+/dist
+/docs
+/.workbuddy
+/.superpowers
+*.log
+*.tar.gz
+__pycache__/
+tests/repro/e2e_src.txt
+/e2e_src.txt

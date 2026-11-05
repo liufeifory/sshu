@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    name: test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Test
+        run: cargo test --verbose
+
+  linux-e2e:
+    name: linux e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Enable local sshd for e2e
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server
+          echo 'root:root' | sudo chpasswd
+          sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo service ssh restart || sudo service sshd restart
+      - name: Run linux e2e
+        env:
+          SSHU_TEST_USER: root
+          SSHU_TEST_PASS: root
+        run: python3 tests/repro/repro_linux.py ./target/release/sshu
