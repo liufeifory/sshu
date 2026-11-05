@@ -52,13 +52,8 @@ pub struct InputState {
     /// `None` = 行内容不可知（光标键、Tab 补全等），此时不做 magic 拦截。
     line_len: Option<usize>,
     pre: Option<Vec<u8>>,
-    /// 是否对当前 pre 做了本地回显（仅在确认处于 bash 提示符时回显，
-    /// 避免把密码首字符打到屏幕上）。
-    pre_echo: bool,
     /// 已本地回显的 pre 字节数，冲刷时需要先擦除。
     pre_echoed: usize,
-    /// 本行内是否见过 OSC7 提示符（回显门控）。
-    prompt_seen: bool,
     alt_screen: bool,
     line: String,
     auto_return: bool,
@@ -74,9 +69,7 @@ impl InputState {
             mode: Mode::Pass,
             line_len: Some(0),
             pre: None,
-            pre_echo: false,
             pre_echoed: 0,
-            prompt_seen: false,
             alt_screen: false,
             line: String::new(),
             auto_return: false,
@@ -93,7 +86,6 @@ impl InputState {
     pub fn note_prompt(&mut self) {
         debuglog::log("state", "osc7 prompt -> line_len=Some(0)");
         self.line_len = Some(0);
-        self.prompt_seen = true;
     }
 
     pub fn in_cmd_mode(&self) -> bool {
@@ -112,8 +104,6 @@ impl InputState {
             match b {
                 0x0d | 0x0a => {
                     self.line_len = Some(0);
-                    // 回车后到下一个提示符之间（sudo 密码等）不回显。
-                    self.prompt_seen = false;
                 }
                 // 退格 / Ctrl-H：删一个字符；删光后恢复行首。
                 0x7f | 0x08 => self.line_len = self.line_len.map(|n| n.saturating_sub(1)),
@@ -193,9 +183,7 @@ impl InputState {
                     self.pre_echoed = 0;
                     // 补上触发词的那个空格的回显：前几个字符已逐字回显，
                     // 空格是判定字符，不补的话屏幕上是 "put/root/x" 这种缺空格的样子。
-                    if self.pre_echo {
-                        out.push(Action::Local(vec![b]));
-                    }
+                    out.push(Action::Local(vec![b]));
                     // 不再打印 "(sshu) <词>"：提示符行上已本地回显该词，
                     // 参数就地续输，观感与 bash 一致；
                     // "(sshu) " 提示符仅在前缀键（Ctrl-]）进入时出现。
@@ -237,7 +225,6 @@ impl InputState {
             && MAGIC.iter().any(|w| w.starts_with(&[b]));
         if can_start {
             debuglog::log("magic", "capture first byte (pending)");
-            self.pre_echo = self.prompt_seen;
             self.pre_echoed = 0;
             self.pre = Some(vec![b]);
             if self.echo_pre_byte(&[b], out) {
@@ -250,15 +237,13 @@ impl InputState {
         self.forwarded(&[b]);
     }
 
-    /// 本地回显 pre 里的字节（仅在确认过提示符时，防止密码首字符上屏）。
+    /// 本地回显 pre 里的字节（始终回显，保证 magic 词开头字符可见）。
+    /// 密码提示等远端不回显的场景下，冲刷时会先擦除已回显字节再透传，
+    /// 屏幕上不会残留密码字符（仅短暂闪现）。
     /// 返回是否真的回显了（未回显时不得计入 pre_echoed，否则冲刷会多发擦除序列）。
     fn echo_pre_byte(&mut self, bytes: &[u8], out: &mut Vec<Action>) -> bool {
-        if self.pre_echo {
-            out.push(Action::Local(bytes.to_vec()));
-            true
-        } else {
-            false
-        }
+        out.push(Action::Local(bytes.to_vec()));
+        true
     }
 
     /// 冲刷 pre 前擦除已回显的字符，远端回显会接上，视觉无缝。
@@ -589,7 +574,9 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(sent, b"ls -la\r");
-        assert!(a.iter().all(|x| matches!(x, Action::ToRemote(_))));
+        // 'l' 先被当作 magic 候选本地回显，'s' 到来时擦除再透传；
+        // 远端回显接上后视觉无缝，最终透传内容不受影响。
+        assert_eq!(locals(&a), b"l\x08 \x08");
     }
 
     #[test]
@@ -836,12 +823,16 @@ mod tests {
     }
 
     #[test]
-    fn no_echo_no_erase() {
-        // 未见过提示符时 pre 不回显，冲刷时也不得多发擦除序列。
+    fn password_prompt_no_leftover() {
+        // 密码提示（远端不回显）场景：首字符短暂本地回显，
+        // 下一个字符到来时先擦除再透传，屏幕上不残留密码字符。
         let mut s = InputState::new(0x1d, true);
-        let a = s.feed(b"ls -la\r");
-        assert_eq!(sent(&a), b"ls -la\r");
-        assert!(a.iter().all(|x| matches!(x, Action::ToRemote(_))));
+        let _ = s.feed(b"sudo x\r");
+        let a = s.feed(b"p");
+        assert_eq!(locals(&a), b"p");
+        let a = s.feed(b"a");
+        assert_eq!(locals(&a), b"\x08 \x08");
+        assert_eq!(sent(&a), b"pa");
     }
 
     #[test]
@@ -930,22 +921,23 @@ mod tests {
     }
 
     #[test]
-    fn no_echo_before_first_prompt() {
-        // 未见过 OSC7 提示符（如远端密码输入）不回显，防密码首字符上屏。
+    fn echo_even_before_first_prompt() {
+        // 无论是否见过 OSC7 提示符都本地回显（用户要求一直显示），
+        // 冲刷时先擦除再透传，密码场景不会残留字符。
         let mut s = InputState::new(0x1d, true);
         let a = s.feed(b"u");
-        assert!(locals(&a).is_empty());
+        assert_eq!(locals(&a), b"u");
         assert!(sent(&a).is_empty());
     }
 
     #[test]
-    fn no_echo_after_enter_without_new_prompt() {
-        // 回车后未见新提示符（sudo 密码等）同样不回显。
+    fn echo_after_enter_without_new_prompt() {
+        // 回车后未见新提示符（sudo 密码等）也回显，冲刷时擦除兜底。
         let mut s = InputState::new(0x1d, true);
         s.note_prompt();
         let _ = s.feed(b"sudo x\r");
         let a = s.feed(b"u");
-        assert!(locals(&a).is_empty());
+        assert_eq!(locals(&a), b"u");
     }
 
     #[test]
