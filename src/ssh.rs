@@ -181,6 +181,43 @@ pub async fn probe_shell(handle: &Handle<ClientHandler>) -> Option<String> {
     }
 }
 
+/// 通过 exec 通道读取交互 shell 的真实 cwd：找出该用户最新的带 tty 的
+/// shell 进程（su 切换后的新 shell pid 最大），readlink /proc/<pid>/cwd。
+/// 用于 `su` / `su -` 之后 OSC 7 断供时的精确 cwd 回退——只读，零注入。
+pub async fn probe_cwd(handle: &Handle<ClientHandler>, user: &str) -> Option<String> {
+    // user 来自提示符解析，做个白名单防注入
+    if user.is_empty() || !user.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+    {
+        return None;
+    }
+    let ch = handle.channel_open_session().await.ok()?;
+    let script = format!(
+        r#"P=$(ps -o pid= -o tty= -o args= -u '{}' 2>/dev/null | awk '$2!~/\?/ && $3 ~ /bash|zsh|ksh|sh$/ {{print $1}}' | sort -n | tail -1); [ -n "$P" ] && readlink /proc/$P/cwd"#,
+        user
+    );
+    ch.exec(true, script.as_str()).await.ok()?;
+    let (mut read, _write) = ch.split();
+
+    let fut = async {
+        let mut out = Vec::new();
+        while let Some(msg) = read.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        out
+    };
+    let out = tokio::time::timeout(Duration::from_secs(10), fut).await.ok()?;
+    let s = String::from_utf8_lossy(&out).trim().to_string();
+    if s.starts_with('/') {
+        Some(s)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug)]
 pub enum ShellEvent {
     Data(Vec<u8>),
@@ -195,7 +232,7 @@ pub struct Shell {
 }
 
 pub async fn spawn_shell(
-    handle: Handle<ClientHandler>,
+    handle: &Handle<ClientHandler>,
     cmd: Option<String>,
     cols: u16,
     rows: u16,

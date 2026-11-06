@@ -29,7 +29,7 @@ async fn hook_install_and_cwd_tracking() {
     };
     assert!(hook_command(shell.as_deref()).is_some());
 
-    let shell_conn = spawn_shell(handle, Some(cmd), 100, 30).await.unwrap();
+    let shell_conn = spawn_shell(&handle, Some(cmd), 100, 30).await.unwrap();
     let (mut events, input) = (shell_conn.events, shell_conn.input);
     let mut tracker = Osc7Tracker::new();
 

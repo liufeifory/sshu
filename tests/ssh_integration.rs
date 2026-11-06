@@ -63,7 +63,7 @@ async fn probe_shell_reports_bash() {
 #[ignore]
 async fn shell_streams_output() {
     let handle = connect(opts()).await.unwrap();
-    let shell = spawn_shell(handle, None, 100, 30).await.unwrap();
+    let shell = spawn_shell(&handle, None, 100, 30).await.unwrap();
     let (mut events, input) = (shell.events, shell.input);
     let got = timeout(Duration::from_secs(10), async {
         loop {
@@ -83,7 +83,7 @@ async fn shell_streams_output() {
 #[ignore]
 async fn shell_reports_eof_on_exit() {
     let handle = connect(opts()).await.unwrap();
-    let shell = spawn_shell(handle, None, 80, 24).await.unwrap();
+    let shell = spawn_shell(&handle, None, 80, 24).await.unwrap();
     let (mut events, input) = (shell.events, shell.input);
     // wait for first prompt data, then exit
     let _ = timeout(Duration::from_secs(10), async {
@@ -114,7 +114,7 @@ async fn shell_reports_eof_on_exit() {
 #[ignore]
 async fn exec_shell_reports_eof_on_exit() {
     let handle = connect(opts()).await.unwrap();
-    let shell = spawn_shell(handle, Some("exec /bin/bash -i".to_string()), 80, 24)
+    let shell = spawn_shell(&handle, Some("exec /bin/bash -i".to_string()), 80, 24)
         .await
         .unwrap();
     let (mut events, input) = (shell.events, shell.input);
@@ -153,7 +153,7 @@ async fn hook_shell_reports_eof_on_exit() {
         HookOutcome::Installed(c) => c,
         other => panic!("hook: {other:?}"),
     };
-    let shell = spawn_shell(handle, Some(cmd), 80, 24).await.unwrap();
+    let shell = spawn_shell(&handle, Some(cmd), 80, 24).await.unwrap();
     let (mut events, input) = (shell.events, shell.input);
     let _ = timeout(Duration::from_secs(10), async {
         while let Some(ev) = events.recv().await {

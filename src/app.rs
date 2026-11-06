@@ -13,7 +13,7 @@ use crate::input::{Action, Command, InputState};
 use crate::mouse;
 use crate::osc7::Osc7Tracker;
 use crate::sftp::{HookOutcome, Progress, Sftp, TransferSummary};
-use crate::ssh::{probe_shell, spawn_shell, ClientHandler, Shell, ShellEvent};
+use crate::ssh::{probe_cwd, probe_shell, spawn_shell, ClientHandler, Shell, ShellEvent};
 use crate::status::{StatusLine, StatusSlot, TransferStatus};
 use crate::term::Console;
 
@@ -39,6 +39,14 @@ pub async fn run(
     let mut osc = Osc7Tracker::new();
     let mut status = StatusSlot::new();
     let gate = TransferGate::default();
+
+    // 读一次 /etc/passwd：su 切用户后提示符里的 ~ 据此解析成家目录
+    // （OSC 7 断供时的提示符回退，见 osc7.rs）。失败则退回 /home/<user> 惯例。
+    if let Some(sftp) = &sftp {
+        if let Ok(data) = sftp.read_small_file("/etc/passwd").await {
+            osc.set_homes(crate::osc7::parse_passwd(&data));
+        }
+    }
 
     let shell_name = probe_shell(&handle).await;
     let mut hook_cmd = None;
@@ -66,7 +74,7 @@ pub async fn run(
     let (cols, rows) = console.size();
     // 最后一行留给状态栏，远端 PTY 只使用前 rows-1 行。
     let content_rows = rows.saturating_sub(1).max(1);
-    let mut shell = spawn_shell(handle, hook_cmd, cols, content_rows)
+    let mut shell = spawn_shell(&handle, hook_cmd, cols, content_rows)
         .await
         .map_err(AppError::OpenShell)?;
 
@@ -116,8 +124,8 @@ pub async fn run(
                 crate::debuglog::log_bytes("console-in", &bytes);
                 kbuf.extend_from_slice(&bytes);
                 drain_input(
-                    &mut kbuf, &mut kbuf_at, &mut input, &shell, &console, &mut screen,
-                    &gate, &mut status, &sftp, &osc, &st_tx,
+                    &handle, &mut kbuf, &mut kbuf_at, &mut input, &shell, &console, &mut screen,
+                    &gate, &mut status, &sftp, &mut osc, &st_tx,
                 ).await;
             }
             Some(ev) = shell.events.recv() => {
@@ -175,7 +183,7 @@ pub async fn run(
                     if t.elapsed() >= Duration::from_millis(20) && !kbuf.is_empty() {
                         let rest = std::mem::take(&mut kbuf);
                         kbuf_at = None;
-                        keys(&rest, &mut input, &shell, &console, &mut screen, &gate, &mut status, &sftp, &osc, &st_tx).await;
+                        keys(&handle, &rest, &mut input, &shell, &console, &mut screen, &gate, &mut status, &sftp, &mut osc, &st_tx).await;
                     }
                 }
             }
@@ -267,9 +275,37 @@ fn scroll_key(bytes: &[u8]) -> Option<bool> {
     }
 }
 
+/// 远端当前目录：OSC 7 优先；`su` 切用户后 OSC 7 断供，用提示符回退 +
+/// exec 通道读 /proc/<交互shell的pid>/cwd 探测（零注入，结果按提示符事件缓存）。
+async fn resolved_cwd(
+    handle: &Handle<ClientHandler>,
+    osc: &mut Osc7Tracker,
+) -> Option<String> {
+    if !osc.needs_probe() {
+        return osc.remote_cwd();
+    }
+    if let Some(c) = osc.exec_fresh() {
+        crate::debuglog::log("cwd", &format!("probe cache: {c}"));
+        return Some(c);
+    }
+    let seq = osc.prompt_seq();
+    if let Some(user) = osc.guess_user().map(str::to_string) {
+        match probe_cwd(handle, &user).await {
+            Some(c) => {
+                crate::debuglog::log("cwd", &format!("probe /proc cwd of {user}: {c}"));
+                osc.store_exec(c.clone(), seq);
+                return Some(c);
+            }
+            None => crate::debuglog::log("cwd", &format!("probe /proc cwd of {user} failed")),
+        }
+    }
+    osc.remote_cwd()
+}
+
 /// 把控制台字节流拆成「滚轮事件」和「普通按键」两类，分别处理。
 #[allow(clippy::too_many_arguments)]
 async fn drain_input(
+    handle: &Handle<ClientHandler>,
     kbuf: &mut Vec<u8>,
     kbuf_at: &mut Option<Instant>,
     input: &mut InputState,
@@ -279,7 +315,7 @@ async fn drain_input(
     gate: &TransferGate,
     status: &mut StatusSlot,
     sftp: &Option<Sftp>,
-    osc: &Osc7Tracker,
+    osc: &mut Osc7Tracker,
     st_tx: &mpsc::UnboundedSender<TransferStatus>,
 ) {
     loop {
@@ -304,14 +340,14 @@ async fn drain_input(
                 Some(pos) => {
                     let head: Vec<u8> = kbuf.drain(..pos).collect();
                     if !head.is_empty() {
-                        keys(&head, input, shell, console, screen, gate, status, sftp, osc, st_tx)
+                        keys(handle, &head, input, shell, console, screen, gate, status, sftp, osc, st_tx)
                             .await;
                     }
                 }
                 None => {
                     let all = std::mem::take(kbuf);
                     *kbuf_at = None;
-                    keys(&all, input, shell, console, screen, gate, status, sftp, osc, st_tx).await;
+                    keys(handle, &all, input, shell, console, screen, gate, status, sftp, osc, st_tx).await;
                     return;
                 }
             },
@@ -322,6 +358,7 @@ async fn drain_input(
 /// 普通按键：翻页键优先，其余交给输入状态机。
 #[allow(clippy::too_many_arguments)]
 async fn keys(
+    handle: &Handle<ClientHandler>,
     bytes: &[u8],
     input: &mut InputState,
     shell: &Shell,
@@ -330,7 +367,7 @@ async fn keys(
     gate: &TransferGate,
     status: &mut StatusSlot,
     sftp: &Option<Sftp>,
-    osc: &Osc7Tracker,
+    osc: &mut Osc7Tracker,
     st_tx: &mpsc::UnboundedSender<TransferStatus>,
 ) {
     if bytes.is_empty() {
@@ -366,14 +403,15 @@ async fn keys(
         if let Action::Complete(line) = action {
             // Tab 补全：远端路径需要 SFTP 异步列目录，就地 await。
             crate::debuglog::log("cmd", &format!("complete: {line:?}"));
-            let comp = crate::complete::compute(&line, sftp, osc.cwd()).await;
+            let rc = resolved_cwd(handle, osc).await;
+            let comp = crate::complete::compute(&line, sftp, rc.as_deref()).await;
             let mut acts = Vec::new();
             input.apply_completion(comp, &mut acts);
             for a in acts {
-                dispatch(a, shell, console, screen, gate, status, sftp, osc, st_tx);
+                dispatch(handle, a, shell, console, screen, gate, status, sftp, osc, st_tx).await;
             }
         } else {
-            dispatch(action, shell, console, screen, gate, status, sftp, osc, st_tx);
+            dispatch(handle, action, shell, console, screen, gate, status, sftp, osc, st_tx).await;
         }
     }
 }
@@ -428,7 +466,8 @@ fn set_mouse_capture(console: &Console, level: u8) {
 }
 
 /// 统一处理输入状态机产出的动作（输入分支与空闲 tick 共用）。
-fn dispatch(
+async fn dispatch(
+    handle: &Handle<ClientHandler>,
     action: Action,
     shell: &Shell,
     console: &Console,
@@ -436,7 +475,7 @@ fn dispatch(
     gate: &TransferGate,
     status: &mut StatusSlot,
     sftp: &Option<Sftp>,
-    osc: &Osc7Tracker,
+    osc: &mut Osc7Tracker,
     st_tx: &mpsc::UnboundedSender<TransferStatus>,
 ) {
     match action {
@@ -478,7 +517,8 @@ fn dispatch(
                         let _ = console.write_all(out.as_bytes());
                     } else {
                         status.begin();
-                        start_command(sftp, &cmd, osc.cwd(), st_tx);
+                        let rc = resolved_cwd(handle, osc).await;
+                        start_command(sftp, &cmd, rc.as_deref(), st_tx);
                     }
                 }
             }
