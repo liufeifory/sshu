@@ -41,8 +41,9 @@ drwxr-xr-x        - 2026-11-05 12:40 dist/
 - **Ctrl-] 命令模式**：前缀键进入 `(sshu)` 本地命令模式，空行回车回到远端 shell。
 - **终端网格渲染**：内置基于 [alacritty_terminal](https://github.com/alacritty/alacritty) 的终端模拟器，
   远端输出先进入 VT100/xterm 网格再按行重绘，top / vim / less 等全屏应用进出后画面不再错乱。
-- **回滚历史**：`PgUp` / `PgDn`（含 `Shift`/`Ctrl` 组合）在客户端内翻页查看历史（默认 10000 行），
-  任意键入自动回到最新输出。
+- **回滚历史**：鼠标滚轮 / `PgUp` / `PgDn`（含 `Shift`/`Ctrl` 组合）在客户端内翻看历史
+  （默认 20000 行，`--history` 可调，每行约占 3 KB 内存）；任意键入自动回到最新输出。
+  查看历史时底部状态栏会提示当前回滚行数。
 
 `upload` / `download` 保留为 `put` / `get` 的兼容别名。
 
@@ -108,7 +109,10 @@ sshu --debug root@host
 
 ## 已知限制
 
-- 回滚历史用 `PgUp` / `PgDn` 翻页，暂不支持鼠标滚轮滚动。
+- 为了收滚轮事件，客户端会向外层终端开启鼠标上报（`?1000h` + `?1006h`）：
+  选中文字需按住 **Shift 再拖选**（Windows Terminal / VS Code 终端通用做法）；
+  不想要这个行为可以加 `--no-mouse`，此时滚轮交回外层终端，历史只能用 `PgUp` / `PgDn` 翻。
+- 鼠标上报会按远端需求切换级别（vim / htop 开了鼠标时，事件原样转给远端，滚轮不再翻本地历史）。
 - 远端设置的窗口标题（OSC 0/2）不会转发给本地终端。
 
 - 只有密码登录；不支持私钥、Pageant、ssh-agent。

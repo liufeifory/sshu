@@ -33,6 +33,14 @@ pub struct Args {
 
     #[arg(long, default_value_t = 20)]
     pub timeout: u64,
+
+    /// 回滚历史行数（每行约 3 KB 内存）
+    #[arg(long, default_value_t = crate::emu::DEFAULT_HISTORY)]
+    pub history: usize,
+
+    /// 不接管鼠标：滚轮交回外层终端（此时无法用滚轮翻历史）
+    #[arg(long = "no-mouse", action = clap::ArgAction::SetFalse)]
+    pub mouse: bool,
 }
 
 pub fn parse() -> Args {

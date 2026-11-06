@@ -17,21 +17,26 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, Processor};
 
-/// 回滚历史行数（供 PgUp/PgDn 翻页查看）。
-const HISTORY_LINES: usize = 10000;
+/// 默认回滚历史行数（供滚轮 / PgUp / PgDn 查看）。
+/// 每行约占 3 KB 内存（100 列 × 32 B/单元格），2 万行 ≈ 60 MB。
+pub const DEFAULT_HISTORY: usize = 20_000;
+
+/// 回滚上限：避免 --history 被写成天文数字把内存吃光。
+const MAX_HISTORY: usize = 200_000;
 
 /// 终端尺寸（屏幕行 + 回滚历史）。
 #[derive(Clone, Copy)]
 struct Dims {
     columns: usize,
     screen_lines: usize,
+    history: usize,
 }
 
 impl Dimensions for Dims {
     fn total_lines(&self) -> usize {
         // 屏幕行 + 回滚历史：本机终端的历史由我们自己维护
         // （渲染接管屏幕后，conhost 的 scrollback 不再被填充）。
-        self.screen_lines + HISTORY_LINES
+        self.screen_lines + self.history
     }
     fn screen_lines(&self) -> usize {
         self.screen_lines
@@ -46,19 +51,33 @@ pub struct Emu {
     processor: Processor,
     cols: usize,
     rows: usize,
+    history: usize,
 }
 
 impl Emu {
     pub fn new(cols: u16, rows: u16) -> Self {
+        Self::with_history(cols, rows, DEFAULT_HISTORY)
+    }
+
+    pub fn with_history(cols: u16, rows: u16, history: usize) -> Self {
+        let history = history.clamp(0, MAX_HISTORY);
         let dims = Dims {
             columns: cols.max(1) as usize,
             screen_lines: rows.max(1) as usize,
+            history,
+        };
+        // 历史容量由 Config.scrolling_history 决定（Dimensions 里的
+        // total_lines 只是给外部描述用）。
+        let config = Config {
+            scrolling_history: history,
+            ..Config::default()
         };
         Self {
-            term: Term::new(Config::default(), &dims, VoidListener),
+            term: Term::new(config, &dims, VoidListener),
             processor: Processor::new(),
             cols: dims.columns,
             rows: dims.screen_lines,
+            history,
         }
     }
 
@@ -93,6 +112,7 @@ impl Emu {
         self.term.resize(Dims {
             columns: self.cols,
             screen_lines: self.rows,
+            history: self.history,
         });
     }
 
@@ -103,6 +123,30 @@ impl Emu {
 
     pub fn scroll_display(&mut self, scroll: Scroll) {
         self.term.scroll_display(scroll);
+    }
+
+    /// 远端是否自己开了鼠标上报（vim/htop 之类）。
+    pub fn mouse_reporting(&self) -> bool {
+        self.mouse_level() > 0
+    }
+
+    /// 远端鼠标上报级别：0 关，1 点击，2 拖拽，3 移动。
+    pub fn mouse_level(&self) -> u8 {
+        let mode = self.term.mode();
+        if mode.contains(TermMode::MOUSE_MOTION) {
+            3
+        } else if mode.contains(TermMode::MOUSE_DRAG) {
+            2
+        } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// 应用光标键模式（smkx）：方向键要发 SS3 序列。
+    pub fn app_cursor(&self) -> bool {
+        self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
     /// 测试辅助：读出整行文本。
@@ -251,8 +295,12 @@ pub struct Screen {
 impl Screen {
     /// rows 为内容行数（不含状态栏行）。
     pub fn new(cols: u16, rows: u16) -> Self {
+        Self::with_history(cols, rows, DEFAULT_HISTORY)
+    }
+
+    pub fn with_history(cols: u16, rows: u16, history: usize) -> Self {
         Self {
-            emu: Emu::new(cols, rows),
+            emu: Emu::with_history(cols, rows, history),
             prev: Vec::new(),
             cursor: None,
         }
@@ -345,7 +393,7 @@ impl Screen {
         format!("\x1b[?25l{out}\x1b[?25h")
     }
 
-    /// 翻页查看历史（与真实终端一致：仅普通屏幕生效）。
+    /// 翻页查看历史（与真实终端一致：全屏应用里交给应用自己处理）。
     pub fn scroll_page(&mut self, up: bool) -> String {
         if self.emu.fullscreen() {
             return String::new();
@@ -357,6 +405,38 @@ impl Screen {
             .scroll_display(if up { Scroll::PageUp } else { Scroll::PageDown });
         self.cursor = None;
         self.render()
+    }
+
+    /// 滚轮按行滚动（正数向上）。全屏应用里没有本地历史可看，直接忽略。
+    pub fn scroll_lines(&mut self, lines: i32) -> String {
+        if self.emu.fullscreen() {
+            return String::new();
+        }
+        if lines < 0 && self.emu.display_offset() == 0 {
+            return String::new();
+        }
+        self.emu.scroll_display(Scroll::Delta(lines));
+        self.cursor = None;
+        self.render()
+    }
+
+    /// 当前回滚偏移（0 = 最新输出）。
+    pub fn scroll_offset(&self) -> usize {
+        self.emu.display_offset()
+    }
+
+    /// 远端是否自己开了鼠标上报（决定滚轮事件转给远端还是本地翻历史）。
+    pub fn mouse_reporting(&self) -> bool {
+        self.emu.mouse_level() > 0
+    }
+
+    /// 远端鼠标上报级别：0 关，1 点击，2 拖拽，3 移动。
+    pub fn mouse_level(&self) -> u8 {
+        self.emu.mouse_level()
+    }
+
+    pub fn app_cursor(&self) -> bool {
+        self.emu.app_cursor()
     }
 
     /// 回到最新输出（有新键入时调用，和真实终端行为一致）。
@@ -491,6 +571,10 @@ mod tests {
 mod scroll_probe {
     use super::*;
 
+    fn lines(n: usize) -> Vec<u8> {
+        (0..n).flat_map(|i| format!("{i:03}\r\n").into_bytes()).collect()
+    }
+
     #[test]
     fn scroll_page_reveals_history() {
         let mut s = Screen::new(20, 3);
@@ -510,5 +594,42 @@ mod scroll_probe {
             .map(|t| t.chars().next().unwrap_or(' '))
             .collect();
         assert_ne!(bottom, after, "offset={} out_empty={}", s.emu.display_offset(), out.is_empty());
+    }
+
+    #[test]
+    fn history_depth_follows_config() {
+        let mut s = Screen::with_history(20, 3, 5000);
+        let _ = s.feed(&lines(100));
+        s.emu.scroll_display(Scroll::Top);
+        // 100 行内容 + 结尾空行 - 3 行屏幕 = 98 行历史
+        assert_eq!(s.emu.display_offset(), 98);
+    }
+
+    #[test]
+    fn history_stops_at_configured_limit() {
+        let mut s = Screen::with_history(20, 3, 10);
+        let _ = s.feed(&lines(100));
+        s.emu.scroll_display(Scroll::Top);
+        assert_eq!(s.emu.display_offset(), 10);
+    }
+
+    #[test]
+    fn scroll_lines_moves_and_clamps() {
+        let mut s = Screen::with_history(20, 3, 1000);
+        let _ = s.feed(&lines(40));
+        let out = s.scroll_lines(5);
+        assert_eq!(s.scroll_offset(), 5);
+        assert!(!out.is_empty());
+        s.scroll_lines(-100);
+        assert_eq!(s.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn scroll_lines_ignored_in_fullscreen() {
+        let mut s = Screen::with_history(20, 3, 1000);
+        let _ = s.feed(&lines(40));
+        s.feed(b"\x1b[?1049h");
+        assert!(s.scroll_lines(5).is_empty());
+        assert_eq!(s.scroll_offset(), 0);
     }
 }

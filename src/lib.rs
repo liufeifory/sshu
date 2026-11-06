@@ -2,6 +2,7 @@ pub mod app;
 pub mod cli;
 pub mod debuglog;
 pub mod emu;
+pub mod mouse;
 pub mod error;
 pub mod hook;
 pub mod complete;

@@ -127,6 +127,39 @@ def main():
         p.send(b"echo after_clear_$((3*4))\r")
         time.sleep(1.2)
         check("command after clear", "after_clear_12" in text())
+
+        # 10 滚轮翻历史（SGR 鼠标）
+        p.send(b"seq 1 300\r")
+        time.sleep(1.6)
+        before = "\n".join(tail(3))
+        p.send(b"\x1b[<64;10;10M")  # wheel up
+        time.sleep(0.8)
+        after = "\n".join(tail(3))
+        check("wheel scrolls history", after != before, f"{before.splitlines()[-1]!r} -> {after.splitlines()[-1]!r}")
+        p.send(b"\x1b[<65;10;10M")  # wheel down
+        time.sleep(0.8)
+        check("wheel scrolls back", "\n".join(tail(3)) == before)
+        p.send(b"echo wheel_ok_$((2*3))\r")
+        time.sleep(1.2)
+        check("typing returns to live output", "wheel_ok_6" in text())
+
+        # 11 全屏应用里滚轮转方向键（less 自己翻页）
+        # 从文件末尾开始，滚轮向上才有得翻；按「新输出」等待，避免匹配到上一次 less 的残留。
+        mark = len(p.text())
+        p.send(b"seq 1 200 | less +G\r")
+        deadline = time.time() + 12
+        while time.time() < deadline and "(END)" not in p.text()[mark:]:
+            time.sleep(0.1)
+        time.sleep(0.6)
+        sync()
+        top_before = screen.display[0].rstrip()
+        p.send(b"\x1b[<64;10;10M")
+        time.sleep(0.8)
+        sync()
+        top_after = screen.display[0].rstrip()
+        check("wheel in less", top_before != top_after, f"{top_before} -> {top_after}")
+        p.send(b"q")
+        time.sleep(0.8)
     finally:
         p.close()
 
