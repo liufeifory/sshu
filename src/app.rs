@@ -100,10 +100,6 @@ pub async fn run(
         let _ = console.write_all(out.as_bytes());
     }
 
-    let mut bar = Bar::new(cols, rows);
-    bar.setup(&console);
-
-    let mut last_status = String::new();
     // 键盘/滚轮分流缓冲：鼠标序列可能被拆成多批字节到达。
     let mut kbuf: Vec<u8> = Vec::new();
     let mut kbuf_at: Option<Instant> = None;
@@ -198,29 +194,26 @@ pub async fn run(
             let _ = console.write_all(clear.as_bytes());
             let out = screen.render();
             let _ = console.write_all(out.as_bytes());
-            bar.teardown(&console);
             let _ = shell
                 .resize
                 .send((size.0, size.1.saturating_sub(1).max(1)));
-            bar = Bar::new(size.0, size.1);
-            bar.setup(&console);
-            last_status.clear();
         }
 
-        // 状态栏：传输进度优先，其次是「正在查看历史」提示。
+        // 状态栏：传输进度优先，其次是「正在查看历史」提示；并入网格渲染统一 diff。
         let text = match status.poll(Instant::now()) {
             StatusLine::Show(t) => t,
             StatusLine::Clear | StatusLine::Nothing => match screen.scroll_offset() {
                 0 => String::new(),
-                n => format!("  ↑ 历史 {n} 行 · 滚轮/PgDn 回到底部"),
+                n => format!("  ↑ 历史 {n} 行 · PgDn 回到底部"),
             },
         };
-        if text != last_status {
-            bar.draw(&console, &text);
-            last_status = text;
+        screen.set_bar(&text);
+        let out = screen.render();
+        if !out.is_empty() {
+            let _ = console.write_all(out.as_bytes());
         }
 
-        // 远端开鼠标时按它的要求上报，否则我们自己接管滚轮；模式变了就同步给本机终端。
+        // 远端开鼠标时按它的要求上报；--mouse 才由我们自己接管（默认留给本机终端）。
         let want = match screen.mouse_level() {
             0 if args.mouse => 1,
             0 => 0,
@@ -233,7 +226,8 @@ pub async fn run(
     }
 
     set_mouse_capture(&console, 0);
-    bar.teardown(&console);
+    // 清掉状态栏行
+    let _ = console.write_all(format!("\x1b[{};1H\x1b[K", rows).as_bytes());
     Ok(())
 }
 
@@ -541,52 +535,6 @@ impl TransferGate {
 
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst)
-    }
-}
-
-struct Bar {
-    cols: u16,
-    rows: u16,
-    active: bool,
-}
-
-impl Bar {
-    fn new(cols: u16, rows: u16) -> Self {
-        Self {
-            cols,
-            rows,
-            active: false,
-        }
-    }
-
-    /// 内容区由终端模拟器接管（内容占前 rows-1 行），状态栏直接画在
-    /// 最后一行，不再需要设置滚动区域。
-    fn setup(&mut self, _console: &Console) {
-        if self.rows >= 2 {
-            self.active = true;
-        }
-    }
-
-    fn draw(&self, console: &Console, text: &str) {
-        let width = self.cols.saturating_sub(1) as usize;
-        if self.active {
-            let t: String = text.chars().take(width).collect();
-            let seq = format!("\x1b7\x1b[{};1H\x1b[K{}\x1b8", self.rows, t);
-            let _ = console.write_all(seq.as_bytes());
-        } else {
-            let mut line: String = text.chars().take(width).collect();
-            while line.chars().count() < width {
-                line.push(' ');
-            }
-            let _ = console.write_all(format!("\r{line}\r").as_bytes());
-        }
-    }
-
-    fn teardown(&self, console: &Console) {
-        if self.active {
-            let seq = format!("\x1b[{};1H\x1b[K", self.rows);
-            let _ = console.write_all(seq.as_bytes());
-        }
     }
 }
 

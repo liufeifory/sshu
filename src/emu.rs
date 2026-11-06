@@ -125,6 +125,35 @@ impl Emu {
         self.term.scroll_display(scroll);
     }
 
+    /// 是否处于 1049 备用屏。
+    pub fn alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// 网格当前的历史行数。
+    ///
+    /// `Grid::history_size` 是私有的，用「滚到顶读偏移再还原」探测。
+    /// 只在两次渲染之间调用，瞬时的偏移变化不会写屏。
+    pub fn history_len(&mut self) -> usize {
+        let off = self.term.grid().display_offset();
+        self.term.scroll_display(Scroll::Top);
+        let len = self.term.grid().display_offset();
+        if len != off {
+            self.term.scroll_display(Scroll::Delta(off as i32 - len as i32));
+        }
+        len
+    }
+
+    /// 历史写满后「新增行数」无法再从 history_len 差值算出，
+    /// 把最老的一半丢掉（这些行已进入本机终端的 scrollback，不丢内容）。
+    pub fn compact_history(&mut self, max: usize) {
+        if max < 2 || self.history_len() < max {
+            return;
+        }
+        self.term.grid_mut().update_history(max / 2);
+        self.term.grid_mut().update_history(max);
+    }
+
     /// 远端是否自己开了鼠标上报（vim/htop 之类）。
     pub fn mouse_reporting(&self) -> bool {
         self.mouse_level() > 0
@@ -284,12 +313,23 @@ fn render_row(snaps: &[Snap]) -> String {
 }
 
 /// 屏幕渲染器：持有模拟器，按行 diff 输出 ANSI。
+///
+/// 宿主终端的 scrollback 是「真」历史：网格每滚过一行，就向宿主终端补发
+/// 一个换行，让这一行真正滚出宿主屏幕、进入它的 scrollback —— 这样滚轮、
+/// 滚动条、拖选复制都是本机终端的原生行为。渲染缓存（prev）随之整体上移，
+/// 保证绝对定位始终对得齐。
 pub struct Screen {
     emu: Emu,
-    /// 上一次渲染的每一行内容。
+    /// 上一次渲染的每一行内容（含最后一行状态栏）。
     prev: Vec<Vec<Snap>>,
     /// 上次定位过的光标（1 基），None = 需要重新定位。
     cursor: Option<(u16, u16)>,
+    /// 网格历史容量（用于写满后收缩，保证滚动行数可统计）。
+    max_history: usize,
+    /// 用户查看历史期间网格又滚过的行数，等回到最新屏时一并补发给宿主。
+    debt: usize,
+    /// 底部状态栏文本（本地内容，不属于远端网格）。
+    bar: String,
 }
 
 impl Screen {
@@ -303,12 +343,16 @@ impl Screen {
             emu: Emu::with_history(cols, rows, history),
             prev: Vec::new(),
             cursor: None,
+            max_history: history.clamp(0, MAX_HISTORY),
+            debt: 0,
+            bar: String::new(),
         }
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.emu.resize(cols, rows);
         self.prev.clear();
+        self.debt = 0;
         self.cursor = None;
     }
 
@@ -328,16 +372,65 @@ impl Screen {
         self.emu.rows()
     }
 
+    /// 更新底部状态栏文本（下一帧 render 时按 diff 重画）。
+    pub fn set_bar(&mut self, text: &str) {
+        self.bar = text.to_string();
+    }
+
     /// 远端输出：进网格后渲染差异。
     pub fn feed(&mut self, bytes: &[u8]) -> String {
-        self.emu.feed(bytes);
-        self.render()
+        let mut out = String::new();
+        self.push_remote(bytes, &mut out);
+        out.push_str(&self.render());
+        out
     }
 
     /// 本地打印（命令结果、列表等）：作为合成输出进网格，参与滚动。
     pub fn print(&mut self, bytes: &[u8]) -> String {
+        self.feed(bytes)
+    }
+
+    /// 喂远端字节，并把网格新增的历史行数同步给宿主终端。
+    fn push_remote(&mut self, bytes: &[u8], out: &mut String) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.emu.alt_screen() {
+            // 备用屏（top/vim/less）不产生真正的历史，宿主也不该滚动。
+            self.emu.feed(bytes);
+            return;
+        }
+        self.emu.compact_history(self.max_history);
+        let h0 = self.emu.history_len();
         self.emu.feed(bytes);
-        self.render()
+        let delta = self.emu.history_len().saturating_sub(h0);
+        if delta == 0 {
+            return;
+        }
+        if self.emu.display_offset() == 0 {
+            self.emit_scroll(out, delta);
+        } else {
+            // 正在看历史：宿主画面是历史视图，不能现在滚，记账等回来再补。
+            self.debt += delta;
+        }
+    }
+
+    /// 让宿主终端滚过 n 行：先把光标挪到最后一行再补换行，
+    /// 换行把旧行推进宿主 scrollback，同时渲染缓存整体上移保持对齐。
+    fn emit_scroll(&mut self, out: &mut String, n: usize) {
+        let rows = self.emu.rows() as usize; // 内容行数；物理最后一行是状态栏
+        out.push_str(&format!("\x1b[{};1H", rows + 1));
+        for _ in 0..n {
+            out.push('\n');
+        }
+        let cols = self.prev.first().map_or(0, |r| r.len());
+        if self.prev.len() == rows + 1 && cols > 0 {
+            for _ in 0..n {
+                self.prev.remove(0);
+                self.prev.push(vec![Snap::default(); cols]);
+            }
+        }
+        self.cursor = None;
     }
 
     /// 打字回显是直接写控制台的临时覆盖层，写完后光标位置未知，需重新定位。
@@ -349,17 +442,23 @@ impl Screen {
     pub fn render(&mut self) -> String {
         let cols = self.emu.cols() as usize;
         let rows = self.emu.rows() as usize;
-        if self.prev.len() != rows || self.prev.first().map_or(0, |r| r.len()) != cols {
-            self.prev = vec![vec![Snap::default(); cols]; rows];
+        let total = rows + 1; // 最后一行是本地状态栏
+        if self.prev.len() != total || self.prev.first().map_or(0, |r| r.len()) != cols {
+            self.prev = vec![vec![Snap::default(); cols]; total];
             self.cursor = None;
         }
 
+        let bar = bar_row(&self.bar, cols);
         let mut out = String::new();
-        for row in 0..rows {
+        for row in 0..total {
             let mut snaps = Vec::with_capacity(cols);
             let mut from: Option<usize> = None;
             for col in 0..cols {
-                let s = self.emu.cell(row, col);
+                let s = if row < rows {
+                    self.emu.cell(row, col)
+                } else {
+                    bar[col]
+                };
                 if from.is_none() && s != self.prev[row][col] {
                     from = Some(col);
                 }
@@ -446,15 +545,37 @@ impl Screen {
         }
         self.emu.scroll_display(Scroll::Bottom);
         self.cursor = None;
-        self.render()
+        let mut out = String::new();
+        if self.debt > 0 {
+            // 先清屏再补滚动：宿主当前显示的是历史视图，直接滚会把这份
+            // 历史画面推进 scrollback；清屏后推入的是空白行，不污染历史。
+            out.push_str("\x1b[2J");
+            self.prev.clear();
+            let debt = std::mem::take(&mut self.debt);
+            self.emit_scroll(&mut out, debt);
+        }
+        out.push_str(&self.render());
+        out
     }
 
     /// 清屏并丢弃渲染缓存。
     pub fn clear(&mut self) -> String {
         self.prev.clear();
+        self.debt = 0;
         self.cursor = None;
         "\x1b[2J\x1b[H".to_string()
     }
+}
+
+/// 状态栏行：文本 + 空白填充（最后一列留空，避免触发终端自动换行）。
+fn bar_row(text: &str, cols: usize) -> Vec<Snap> {
+    let mut snaps = Vec::with_capacity(cols);
+    let width = cols.saturating_sub(1);
+    for ch in text.chars().take(width) {
+        snaps.push(Snap { c: ch, ..Snap::default() });
+    }
+    snaps.resize(cols, Snap::default());
+    snaps
 }
 
 #[cfg(test)]
@@ -631,5 +752,46 @@ mod scroll_probe {
         s.feed(b"\x1b[?1049h");
         assert!(s.scroll_lines(5).is_empty());
         assert_eq!(s.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn scroll_pushes_newlines_to_host() {
+        let mut s = Screen::new(20, 3);
+        // 5 行内容 + 结尾空行 = 6 行，屏 3 行 → 宿主要滚 3 行
+        let out = s.feed(b"a\r\nb\r\nc\r\nd\r\ne\r\n");
+        assert_eq!(out.matches('\n').count(), 3, "out={out:?}");
+        // 换行前先把光标挪到物理最后一行（状态栏行）
+        assert!(out.contains("\x1b[4;1H"), "out={out:?}");
+    }
+
+    #[test]
+    fn scroll_debt_flushed_on_return() {
+        let mut s = Screen::new(20, 3);
+        let _ = s.feed(b"a\r\nb\r\nc\r\nd\r\n"); // 滚 2 行
+        let _ = s.scroll_page(true); // 开始查看历史
+        assert!(s.scroll_offset() > 0);
+        let out = s.feed(b"e\r\nf\r\n"); // 又滚 2 行 → 记账不发
+        assert_eq!(out.matches('\n').count(), 0, "out={out:?}");
+        let out = s.reset_scroll(); // 回到底部 → 清屏 + 补发
+        assert!(out.contains("\x1b[2J"), "out={out:?}");
+        assert_eq!(out.matches('\n').count(), 2, "out={out:?}");
+        assert_eq!(s.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn alt_screen_output_does_not_scroll_host() {
+        let mut s = Screen::new(20, 3);
+        s.feed(b"\x1b[?1049h");
+        let out = s.feed(&lines(50));
+        assert_eq!(out.matches('\n').count(), 0, "out={out:?}");
+    }
+
+    #[test]
+    fn bar_text_rendered_on_last_row() {
+        let mut s = Screen::new(20, 3);
+        s.set_bar("hello bar");
+        let out = s.feed(b"hi");
+        assert!(out.contains("hello bar"), "out={out:?}");
+        assert!(out.contains("\x1b[4;1H"), "out={out:?}");
     }
 }

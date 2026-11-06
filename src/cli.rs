@@ -38,8 +38,9 @@ pub struct Args {
     #[arg(long, default_value_t = crate::emu::DEFAULT_HISTORY)]
     pub history: usize,
 
-    /// 不接管鼠标：滚轮交回外层终端（此时无法用滚轮翻历史）
-    #[arg(long = "no-mouse", action = clap::ArgAction::SetFalse)]
+    /// 接管鼠标（滚轮翻客户端内历史；会占用拖选/右键，需 Shift 操作）。
+    /// 默认关闭：滚轮/滚动条/复制粘贴都交给本机终端原生处理。
+    #[arg(long)]
     pub mouse: bool,
 }
 

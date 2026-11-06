@@ -98,9 +98,13 @@ def main():
         check("vim roundtrip", "hello screen" in text())
 
         # 5 长输出
+        mark = len(p.text())
         p.send(b"seq 1 200\r")
         time.sleep(1.8)
         check("scroll tail", "200" in "\n".join(tail(4)), "\n".join(tail(4)))
+        # 宿主终端必须真的收到换行（滚出行进它的 scrollback，滚轮/复制才有内容）
+        fed = p.text()[mark:].count("\n")
+        check("host scrollback fed", fed >= 150, f"host newlines={fed}")
 
         # 6 回滚
         sync()
