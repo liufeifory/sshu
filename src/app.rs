@@ -232,6 +232,33 @@ pub async fn run(
 }
 
 /// 识别翻页键：Some(true)=向上翻一页，Some(false)=向下一页。
+/// 应用光标模式下把普通方向键 / Home / End 翻译成 SS3 形式。
+/// 带修饰键的（如 `\x1b[1;5A`）xterm 本来就走 CSI，保持原样。
+fn translate_app_cursor(bytes: &[u8]) -> Vec<u8> {
+    const MAP: &[(&[u8], &[u8])] = &[
+        (b"\x1b[A", b"\x1bOA"),
+        (b"\x1b[B", b"\x1bOB"),
+        (b"\x1b[C", b"\x1bOC"),
+        (b"\x1b[D", b"\x1bOD"),
+        (b"\x1b[H", b"\x1bOH"),
+        (b"\x1b[F", b"\x1bOF"),
+    ];
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    'scan: while i < bytes.len() {
+        for (from, to) in MAP {
+            if bytes[i..].starts_with(from) {
+                out.extend_from_slice(to);
+                i += from.len();
+                continue 'scan;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
 fn scroll_key(bytes: &[u8]) -> Option<bool> {
     match bytes {
         b"\x1b[5~" | b"\x1b[5;2~" | b"\x1b[5;3~" | b"\x1b[5;5~" => Some(true),
@@ -326,6 +353,15 @@ async fn keys(
     if !back.is_empty() {
         let _ = console.write_all(back.as_bytes());
     }
+    // 远端开应用光标模式（vim/less 的 smkx，DECCKM）后，普通方向键
+    // 要换成 SS3 形式，否则远端认不出来（表现为 vi 里方向键失灵）。
+    let owned;
+    let bytes: &[u8] = if screen.app_cursor() {
+        owned = translate_app_cursor(bytes);
+        &owned
+    } else {
+        bytes
+    };
     for action in input.feed(bytes) {
         if let Action::Complete(line) = action {
             // Tab 补全：远端路径需要 SFTP 异步列目录，就地 await。
@@ -549,6 +585,18 @@ mod tests {
         assert!(!gate.try_begin());
         gate.finish();
         assert!(gate.try_begin());
+    }
+
+    #[test]
+    fn app_cursor_translates_arrows_and_leaves_modified_untouched() {
+        assert_eq!(translate_app_cursor(b"\x1b[A\x1b[B"), b"\x1bOA\x1bOB");
+        assert_eq!(translate_app_cursor(b"\x1b[C\x1b[D"), b"\x1bOC\x1bOD");
+        assert_eq!(translate_app_cursor(b"\x1b[H\x1b[F"), b"\x1bOH\x1bOF");
+        // 带修饰键的 CSI 保持原样；普通字符不受影响
+        assert_eq!(translate_app_cursor(b"\x1b[1;5Aok"), b"\x1b[1;5Aok");
+        // 拆散的序列（前一批 \x1b 结尾）不能误配
+        assert_eq!(translate_app_cursor(b"\x1b"), b"\x1b");
+        assert_eq!(translate_app_cursor(b"x[A"), b"x[A");
     }
 
 }
