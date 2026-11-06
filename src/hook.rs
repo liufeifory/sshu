@@ -51,4 +51,13 @@ mod tests {
         assert!(hook_command(Some("/usr/bin/fish")).is_none());
         assert!(hook_command(None).is_none());
     }
+
+    #[test]
+    fn hook_is_local_only() {
+        // 教训：系统级（/etc/profile.d）钩子 + 导出会让 OSC7 混进 exec 通道，
+        // 污染 SFTP 等二进制子系统（openGauss 机器实测）。钩子必须只装在
+        // 登录用户的 ~/.sshu 里，不导出、不进系统目录。
+        assert!(!HOOK_SH.contains("export"));
+        assert!(!hook_command(Some("/bin/bash")).unwrap().contains("profile.d"));
+    }
 }
