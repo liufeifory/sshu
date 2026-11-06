@@ -16,6 +16,7 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, Processor};
+use unicode_width::UnicodeWidthChar;
 
 /// 默认回滚历史行数（供滚轮 / PgUp / PgDn 查看）。
 /// 每行约占 3 KB 内存（100 列 × 32 B/单元格），2 万行 ≈ 60 MB。
@@ -330,6 +331,11 @@ pub struct Screen {
     debt: usize,
     /// 底部状态栏文本（本地内容，不属于远端网格）。
     bar: String,
+    /// 打字回显覆盖层的光标偏移（行偏移, 列偏移），相对网格光标。
+    /// 覆盖层字符不进网格，网格不知道它们存在；渲染定位光标时必须加上
+    /// 这个偏移，否则光标会跳回已回显字符左边（magic 词前缀逐字回显时
+    /// 尤其明显）。行偏移 >0 时列偏移是绝对列（覆盖层从行首重新计）。
+    overlay: (i32, i32),
 }
 
 impl Screen {
@@ -346,6 +352,7 @@ impl Screen {
             max_history: history.clamp(0, MAX_HISTORY),
             debt: 0,
             bar: String::new(),
+            overlay: (0, 0),
         }
     }
 
@@ -354,6 +361,7 @@ impl Screen {
         self.prev.clear();
         self.debt = 0;
         self.cursor = None;
+        self.overlay = (0, 0);
     }
 
     pub fn fullscreen(&self) -> bool {
@@ -395,6 +403,9 @@ impl Screen {
         if bytes.is_empty() {
             return;
         }
+        // 远端输出进入网格后，覆盖层光标重新以网格光标为锚点；
+        // 被覆盖的回显由调用方按 pending_echo 重画并重新累计偏移。
+        self.overlay = (0, 0);
         if self.emu.alt_screen() {
             // 备用屏（top/vim/less）不产生真正的历史，宿主也不该滚动。
             self.emu.feed(bytes);
@@ -433,9 +444,55 @@ impl Screen {
         self.cursor = None;
     }
 
-    /// 打字回显是直接写控制台的临时覆盖层，写完后光标位置未知，需重新定位。
-    pub fn note_echo(&mut self) {
+    /// 打字回显是直接写控制台的覆盖层：解释这批字节，跟踪覆盖层光标
+    /// 相对网格光标的偏移，渲染时据此定位，光标不会跳回回显内容左边。
+    pub fn note_echo(&mut self, bytes: &[u8]) {
         self.cursor = None;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                0x08 => {
+                    // 退格（冲刷前的擦除）
+                    self.overlay.1 = (self.overlay.1 - 1).max(0);
+                    i += 1;
+                }
+                b'\r' => {
+                    self.overlay.1 = 0;
+                    i += 1;
+                }
+                b'\n' => {
+                    self.overlay.0 += 1;
+                    self.overlay.1 = 0;
+                    i += 1;
+                }
+                0x1b => {
+                    // 覆盖层正常不含转义序列；出现时跳过完整 CSI 以免污染计数。
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == b'[' {
+                        i += 1;
+                        while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {
+                    let rest = match std::str::from_utf8(&bytes[i..]) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            i += 1;
+                            continue;
+                        }
+                    };
+                    let Some(ch) = rest.chars().next() else {
+                        i += 1;
+                        continue;
+                    };
+                    i += ch.len_utf8();
+                    self.overlay.1 += ch.width().unwrap_or(0).max(0) as i32;
+                }
+            }
+        }
     }
 
     /// 计算需要写给控制台的增量 ANSI。
@@ -480,7 +537,16 @@ impl Screen {
         }
 
         let (cr, cc) = self.emu.cursor();
-        let pos = (cr as u16 + 1, cc as u16 + 1);
+        // 覆盖层偏移：行偏移 >0 说明覆盖层换过行（如 "(sshu) " 提示符），
+        // 此时列是绝对列；否则在网格光标所在行上累加。
+        let (r, c) = if self.overlay.0 > 0 {
+            (cr as i32 + self.overlay.0, self.overlay.1)
+        } else {
+            (cr as i32, cc as i32 + self.overlay.1)
+        };
+        let r = r.clamp(0, rows as i32) as u16; // 最后一行是状态栏
+        let c = c.clamp(0, cols.saturating_sub(1) as i32) as u16;
+        let pos = (r + 1, c + 1);
         if self.cursor != Some(pos) {
             out.push_str(&format!("\x1b[{};{}H", pos.0, pos.1));
             self.cursor = Some(pos);
@@ -563,6 +629,7 @@ impl Screen {
         self.prev.clear();
         self.debt = 0;
         self.cursor = None;
+        self.overlay = (0, 0);
         "\x1b[2J\x1b[H".to_string()
     }
 }
@@ -685,6 +752,47 @@ mod tests {
         assert!(!out.is_empty());
         // 4 行内容在 3 行屏幕上滚动，最后一行应是 four 的上一行位置。
         assert_eq!(s.cursor().0, 2);
+    }
+
+    /// magic 词前缀逐字回显后，渲染定位的光标必须在回显字符右边，
+    /// 而不是跳回字符左边（用户可见 bug：u/p/d/g/l 打下去光标在左边）。
+    #[test]
+    fn echo_overlay_keeps_cursor_right_of_echoed_chars() {
+        let mut s = Screen::new(20, 3);
+        let _ = s.feed(b"$ "); // 网格光标 0 基 (0,2)
+        let _ = s.render();
+        s.note_echo(b"u");
+        let out = s.render();
+        // 1 基 (1,4)：$ 之后 u 的右边
+        assert!(out.contains("\x1b[1;4H"), "out={out:?}");
+        s.note_echo(b"p");
+        let out = s.render();
+        assert!(out.contains("\x1b[1;5H"), "out={out:?}");
+    }
+
+    /// 冲刷前的擦除（\x08 \x08）把覆盖层光标收回网格光标处。
+    #[test]
+    fn echo_erase_returns_overlay_to_anchor() {
+        let mut s = Screen::new(20, 3);
+        let _ = s.feed(b"$ ");
+        let _ = s.render();
+        s.note_echo(b"up");
+        s.note_echo(b"\x08 \x08\x08 \x08");
+        let out = s.render();
+        // 回到 1 基 (1,3)
+        assert!(out.contains("\x1b[1;3H"), "out={out:?}");
+    }
+
+    /// "(sshu) " 提示符带换行：行偏移生效后列是绝对列。
+    #[test]
+    fn echo_overlay_newline_uses_absolute_col() {
+        let mut s = Screen::new(20, 3);
+        let _ = s.feed(b"prompt...$ "); // 光标 0 基 (0,10)
+        let _ = s.render();
+        s.note_echo(b"\r\n(sshu) ");
+        let out = s.render();
+        // 下一行行首起 7 列："（sshu) " 后 → 1 基 (2,8)
+        assert!(out.contains("\x1b[2;8H"), "out={out:?}");
     }
 }
 

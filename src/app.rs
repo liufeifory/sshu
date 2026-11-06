@@ -144,7 +144,7 @@ pub async fn run(
                             // 按输入状态重新画出来，光标随之移动。
                             if let Some(pending) = input.pending_echo() {
                                 let _ = console.write_all(pending);
-                                screen.note_echo();
+                                screen.note_echo(pending);
                             }
                         }
                     }
@@ -411,8 +411,8 @@ fn dispatch(
         Action::Local(b) => {
             crate::debuglog::log_bytes("local-echo", &b);
             let _ = console.write_all(&b);
-            // 打字回显是覆盖层，光标位置已脱离网格，下帧需重新定位。
-            screen.note_echo();
+            // 覆盖层光标偏移由 Screen 跟踪，渲染定位时不会跳回左边。
+            screen.note_echo(&b);
         }
         Action::Print(b) => {
             crate::debuglog::log_bytes("print", &b);
